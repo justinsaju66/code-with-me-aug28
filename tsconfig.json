@@ -1,0 +1,14 @@
+{
+	"compilerOptions": {
+		"module": "NodeNext",
+		"target": "esnext",
+		"outDir": "out",
+		"lib": ["esnext", "dom"],
+		"sourceMap": true,
+		"rootDir": "src",
+		"strict": true,   /* enable all strict type-checking options */
+		"skipLibCheck": true,
+		"types": ["node", "vscode"]
+	},
+	"exclude": ["src/test"]
+}

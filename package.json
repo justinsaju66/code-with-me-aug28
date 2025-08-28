@@ -1,0 +1,114 @@
+{
+  "name": "code-with-me",
+  "displayName": "Code with me",
+  "description": "Real-time collaborative coding extension inspired by VS Code Live Share",
+
+  "version": "5.1.8",
+  "publisher": "cybrosys",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:code-with-me-explorer",
+    "onCommand:code-with-me.startSession",
+    "onCommand:code-with-me.joinSession",
+    "onCommand:code-with-me.stopSession",
+    "onCommand:code-with-me.requestWorkspaceInfo",
+    "onCommand:code-with-me.openFromWorkspace"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "code-with-me-explorer",
+          "name": "Code with me"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "code-with-me.startSession",
+        "title": "Code with me: Start Session",
+        "category": "Code with me"
+      },
+      {
+        "command": "code-with-me.joinSession",
+        "title": "Code with me: Join Session",
+        "category": "Code with me"
+      },
+      {
+        "command": "code-with-me.stopSession",
+        "title": "Code with me: Stop Session",
+        "category": "Code with me"
+      },
+      {
+        "command": "code-with-me.requestWorkspaceInfo",
+        "title": "Code with me: Request Workspace Info",
+        "category": "Code with me"
+      },
+      {
+        "command": "code-with-me.openFromWorkspace",
+        "title": "Code with me: Open From Workspace",
+        "category": "Code with me"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "code-with-me.startSession"
+        },
+        {
+          "command": "code-with-me.joinSession"
+        },
+        {
+          "command": "code-with-me.stopSession"
+        },
+        {
+          "command": "code-with-me.requestWorkspaceInfo"
+        },
+        {
+          "command": "code-with-me.openFromWorkspace"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "code-with-me.requestWorkspaceInfo",
+          "when": "view == code-with-me-explorer",
+          "group": "navigation@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "20.x",
+    "@types/ws": "^8.5.11",
+    "@types/vscode": "^1.70.0",
+    "@typescript-eslint/eslint-plugin": "^8.31.1",
+    "@typescript-eslint/parser": "^8.31.1",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "eslint": "^9.25.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "lib0": "^0.2.42",
+    "ws": "^8.18.3",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.5.43"
+  }
+}
