@@ -62,6 +62,11 @@ let guestSessionPermissions: SessionPermissions | null = null;
 let guestUntitledMap: Map<string, vscode.TextDocument> = new Map();
 let lastProcessedContent: Map<string, string> = new Map();
 let isStopping: boolean = false;
+// Session-scoped disposables (event listeners, watchers, etc.)
+let sessionDisposables: vscode.Disposable[] = [];
+// Guards to prevent duplicate registration
+let sessionListenersActive = false;
+let fileWatchersActive = false;
 
 // New variables for batching and sequence tracking
 let lastProcessedSequence = 0;
@@ -801,16 +806,22 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
 
 // Setup file watchers for real-time synchronization
 function setupFileWatchers() {
+    if (fileWatchersActive) {
+        console.log('[CodeWithMe] File watchers already active; skipping re-register');
+        return;
+    }
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (!workspaceFolders) return;
 
     // Watch for file creates only to stream initial content; avoid echoing editor changes
     const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+    // Track watcher for disposal on session end
+    sessionDisposables.push(fileWatcher);
 
     // Disable change rebroadcast to prevent duplication with editor listeners
     // fileWatcher.onDidChange(async (uri) => { /* intentionally disabled */ });
 
-    fileWatcher.onDidCreate(async (uri) => {
+    const createDisposable = fileWatcher.onDidCreate(async (uri) => {
         try {
             if (ws && ws.readyState === 1) {
                 const content = await vscode.workspace.fs.readFile(uri);
@@ -826,13 +837,20 @@ function setupFileWatchers() {
             console.error('[CodeWithMe] Host: file create stream error', e);
         }
     });
+    sessionDisposables.push(createDisposable);
+    fileWatchersActive = true;
 }
 
 // Setup editor change listeners for collaborative editing
 function setupEditorChangeListeners() {
+    if (sessionListenersActive) {
+        console.log('[CodeWithMe] Editor listeners already active; skipping re-register');
+        return;
+    }
     // Per-file debounce and seq/version tracking handled at module scope
 
-    vscode.workspace.onDidChangeTextDocument(async (event) => {
+    const onChangeDisp = vscode.workspace.onDidChangeTextDocument(async (event) => {
+        console.count('[CodeWithMe] onDidChangeTextDocument fired');
         // Skip if this file is currently being updated from remote
         const eventFilePath = event.document.uri.fsPath;
 
@@ -915,7 +933,8 @@ function setupEditorChangeListeners() {
     });
 
     // Track cursor position changes
-    vscode.window.onDidChangeTextEditorSelection(async (event) => {
+    const onSelDisp = vscode.window.onDidChangeTextEditorSelection(async (event) => {
+        console.count('[CodeWithMe] onDidChangeTextEditorSelection fired');
         if (ws && ws.readyState === 1) {
             ws.send(JSON.stringify({
                 type: 'cursor-position',
@@ -932,6 +951,8 @@ function setupEditorChangeListeners() {
             }));
         }
     });
+    sessionDisposables.push(onSelDisp);
+    sessionListenersActive = true;
 }
 
 // Function to send batched updates
@@ -984,6 +1005,7 @@ function setupGuestEditorListeners() {
 async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
     let filePath: string | undefined;
     try {
+        console.count('[CodeWithMe] handleFileChange fired');
         filePath = msg.filePath || msg.path;
         if (!filePath) return;
 
@@ -1044,8 +1066,11 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             return;
         }
 
-        const edit = new vscode.WorkspaceEdit();
-        const changesToApply: { range: vscode.Range; text: string; rangeOffset?: number }[] = [];
+        // We'll apply edits sequentially in a stable, well-defined order to avoid
+        // conflicts for multiple inserts at the same position (e.g., rapid "jj").
+        // This prevents VS Code from interpreting simultaneous edits with identical
+        // ranges unpredictably inside a single WorkspaceEdit.
+        const changesToApply: { range: vscode.Range; text: string; rangeOffset?: number; _idx: number }[] = [];
 
         // First, validate all changes
         for (const change of msg.changes) {
@@ -1062,19 +1087,37 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
                 );
                 
                 // Store the change for later application
-                changesToApply.push({ range, text: change.text, rangeOffset: typeof change.rangeOffset === 'number' ? change.rangeOffset : undefined });
+                changesToApply.push({
+                    range,
+                    text: change.text,
+                    rangeOffset: typeof change.rangeOffset === 'number' ? change.rangeOffset : undefined,
+                    _idx: changesToApply.length // preserve original capture order as stable tiebreaker
+                });
             } catch (e) {
                 console.error('[CodeWithMe] Error processing change:', e);
                 continue;
             }
         }
 
-        // Apply all valid changes in the sender-provided order to avoid reordering
-        for (const { range, text } of changesToApply) {
-            edit.replace(doc.uri, range, text);
-        }
+        // Sort changes: primary by explicit rangeOffset (ascending) when provided,
+        // otherwise by range start (line, character) ascending. For equal keys, use original index.
+        changesToApply.sort((a, b) => {
+            const ao = (typeof a.rangeOffset === 'number') ? a.rangeOffset : Number.POSITIVE_INFINITY;
+            const bo = (typeof b.rangeOffset === 'number') ? b.rangeOffset : Number.POSITIVE_INFINITY;
+            if (ao !== bo) return ao - bo;
+            if (a.range.start.line !== b.range.start.line) return a.range.start.line - b.range.start.line;
+            if (a.range.start.character !== b.range.start.character) return a.range.start.character - b.range.start.character;
+            return a._idx - b._idx;
+        });
 
-        const success = await vscode.workspace.applyEdit(edit);
+        // Apply each change sequentially so subsequent ranges are computed against the updated document
+        let success = true;
+        for (const { range, text } of changesToApply) {
+            const single = new vscode.WorkspaceEdit();
+            single.replace(doc.uri, range, text);
+            const ok = await vscode.workspace.applyEdit(single);
+            if (!ok) { success = false; break; }
+        }
 
         if (success) {
             // Wait for the onDidChangeTextDocument handler to confirm it saw the event.
@@ -2156,6 +2199,14 @@ function cleanupSessionState() {
             lastProcessedSequence = 0;
         }
         catch {}
+        try { fileSeqCounter.clear(); } catch {}
+        // Dispose session-scoped disposables (watchers, listeners)
+        try {
+            for (const d of sessionDisposables) {
+                try { d.dispose(); } catch {}
+            }
+            sessionDisposables = [];
+        } catch {}
         // Clear participant cursor data and dispose decorations
         try {
             participantCursors.clear();
@@ -2166,8 +2217,45 @@ function cleanupSessionState() {
             participantCursorDecorations.clear();
         }
         catch {}
+        // Dispose per-participant decorations
+        try {
+            participantDecorations.forEach(d => { try { d.dispose(); } catch {} });
+            participantDecorations.clear();
+        } catch {}
+        try {
+            cursorDecorations.forEach(d => { try { d.dispose(); } catch {} });
+            cursorDecorations.clear();
+        } catch {}
+        // Dispose attribution/header decorations and clear ownership
+        try {
+            attributionDecorationTypes.forEach(d => { try { d.dispose(); } catch {} });
+            attributionDecorationTypes.clear();
+        } catch {}
+        try {
+            headerDecorationTypes.forEach(d => { try { d.dispose(); } catch {} });
+            headerDecorationTypes.clear();
+        } catch {}
+        try {
+            lineOwnership.clear();
+        } catch {}
+        // Clear per-file sync state maps/sets
+        try { guestUntitledMap.clear(); } catch {}
+        try { lastProcessedContent.clear(); } catch {}
+        try { lastProcessedSeqByFileAndSender.clear(); } catch {}
+        try { updatingFromRemoteFiles.clear(); } catch {}
+        try { editConfirmationPromises.clear(); } catch {}
+        try { recentMessageIds.splice(0, recentMessageIds.length); } catch {}
+        // Clear session participants if present
+        try { (currentSession as any)?.participants?.clear?.(); } catch {}
+        // Reset cached workspace info
+        try { (global as any).__cwm_lastWorkspaceInfo = undefined; } catch {}
         // Close websocket connection
         if (ws) {
+            // Detach handlers to prevent late events after cleanup
+            try { (ws as any).onopen = null; } catch {}
+            try { (ws as any).onmessage = null; } catch {}
+            try { (ws as any).onerror = null; } catch {}
+            try { (ws as any).onclose = null; } catch {}
             try {
                 ws.close(1000, 'Session stopped');
             }
@@ -2177,15 +2265,29 @@ function cleanupSessionState() {
         // Reset session state
         currentSession = null;
         currentRole = null;
+        // Reset guards so a new session can register listeners/watchers
+        sessionListenersActive = false;
+        fileWatchersActive = false;
         // Update status bar
         try {
             updateSyncStatus('Session stopped', '$(circle-slash)');
+            if (syncStatusItem) { syncStatusItem.text = '$(sync) Ready'; syncStatusItem.tooltip = 'Real-time sync status'; }
         }
         catch {}
         console.log('[CodeWithMe] Cleanup: completed cleanupSessionState');
     }
     catch (e) {
         console.warn('[CodeWithMe] Cleanup: error in cleanupSessionState', e);
+    }
+}
+
+// Ensure full cleanup when the extension deactivates
+export function deactivate() {
+    try {
+        console.log('[CodeWithMe] Extension deactivating – running cleanup');
+        cleanupSessionState();
+    } catch (e) {
+        console.warn('[CodeWithMe] Error during deactivate cleanup', e);
     }
 }
 
@@ -2270,20 +2372,15 @@ async function stopSession(notifyOthers: boolean = true, initiatedBy: 'host' | '
         
         cleanupSessionState();
         
-        const shouldReload = 
-            (actualRole === 'guest' && notifyOthers) ||
-            (actualRole === 'guest' && !notifyOthers);
-        
-        if (shouldReload) {
-            console.log(`[CodeWithMe] Scheduling reload for ${actualRole}`);
-            setTimeout(async () => {
-                try {
-                    await reloadWindowRobustly();
-                } catch (e) {
-                    console.error('[CodeWithMe] Reload failed:', e);
-                }
-            }, 300);
-        }
+        // Always reload to ensure absolutely clean state for the next session (host or guest)
+        console.log(`[CodeWithMe] Scheduling reload for ${actualRole}`);
+        setTimeout(async () => {
+            try {
+                await reloadWindowRobustly();
+            } catch (e) {
+                console.error('[CodeWithMe] Reload failed:', e);
+            }
+        }, 300);
         
     } catch (e) {
         console.error('[CodeWithMe] Error during session stop:', e);
