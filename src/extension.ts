@@ -52,7 +52,6 @@ let sessionStatusItem: vscode.StatusBarItem;
 let participantStatusItem: vscode.StatusBarItem;
 let syncStatusItem: vscode.StatusBarItem;
 let currentUserId: string = crypto.randomUUID();
-let isUpdatingFromRemote = false;
 let currentRole: 'host' | 'guest' | null = null;
 let collaborativeSession: any = null;
 let participantCursors: Map<string, any> = new Map();
@@ -62,25 +61,22 @@ let hostSessionPermissions: SessionPermissions | null = null;
 let guestSessionPermissions: SessionPermissions | null = null;
 let guestUntitledMap: Map<string, vscode.TextDocument> = new Map();
 let lastProcessedContent: Map<string, string> = new Map();
-let isHostSendingUpdate: boolean = false;
-let isGuestSendingUpdate: boolean = false;
-let isUpdatingFromHost: boolean = false;
-let isUpdatingFromGuest: boolean = false;
-let lastStateHash: string = '';
-let stateUpdateThrottle: NodeJS.Timeout | null = null;
 let isStopping: boolean = false;
 
 // New variables for batching and sequence tracking
 let lastProcessedSequence = 0;
 let pendingChanges: Map<string, any[]> = new Map();
 let batchTimeout: NodeJS.Timeout | null = null;
-const BATCH_DELAY = 50; // ms
+const BATCH_DELAY = 100; // ms
 // Per-file outgoing sequence counters
 const fileSeqCounter: Map<string, number> = new Map();
 // Per-file, per-sender last processed sequence to de-duplicate on receive
 const lastProcessedSeqByFileAndSender: Map<string, Map<string, number>> = new Map();
 // Recently applied message IDs to avoid duplicate processing regardless of server behavior
 const recentMessageIds: string[] = [];
+// A robust guard to link remote edits to the events they produce.
+// Map<filePath, { resolve: () => void, reject: (reason?: any) => void }>
+const editConfirmationPromises = new Map<string, { resolve: () => void, reject: (reason?: any) => void }>();
 
 // Attribution: global decoration cache and per-file ownership map
 const attributionDecorationTypes: Map<string, vscode.TextEditorDecorationType> = new Map();
@@ -837,21 +833,20 @@ function setupEditorChangeListeners() {
     // Per-file debounce and seq/version tracking handled at module scope
 
     vscode.workspace.onDidChangeTextDocument(async (event) => {
-        if (isUpdatingFromRemote) {
-            console.log('[CodeWithMe] onDidChangeTextDocument: SKIP global flag', {
-                file: event.document.uri.fsPath,
-                changes: event.contentChanges?.length ?? 0
-            });
-            return;
-        }
-
         // Skip if this file is currently being updated from remote
         const eventFilePath = event.document.uri.fsPath;
+
+        // NEW: Robust promise-based guard.
+        // If this change is a known remote edit, resolve the confirmation promise and stop.
         if (updatingFromRemoteFiles.has(eventFilePath)) {
-            console.log('[CodeWithMe] onDidChangeTextDocument: SKIP per-file guard', {
-                file: eventFilePath,
-                changes: event.contentChanges?.length ?? 0
-            });
+            const promiseControls = editConfirmationPromises.get(eventFilePath);
+            if (promiseControls) {
+                console.log(`[CodeWithMe] Confirmed remote edit for ${eventFilePath}, suppressing echo.`);
+                promiseControls.resolve();
+                // The promise is now fulfilled, but we leave the cleanup to the handleFileChange function
+            } else {
+                console.warn(`[CodeWithMe] Guarded event fired for ${eventFilePath}, but no promise found.`);
+            }
             return;
         }
 
@@ -948,10 +943,16 @@ function sendBatchUpdates() {
         
         // Preserve original capture order; do not resort by timestamp
         
+        // Per-file, per-sender monotonic sequence
+        const nextSeq = (fileSeqCounter.get(filePath) || 0) + 1;
+        fileSeqCounter.set(filePath, nextSeq);
+        const messageId = crypto.randomUUID();
+
         ws!.send(JSON.stringify({
             type: 'file-change',
             filePath: filePath,
             originId: currentUserId,
+            messageId,
             changes: changes.map(c => ({
                 range: c.range,
                 rangeLength: c.rangeLength,
@@ -959,7 +960,7 @@ function sendBatchUpdates() {
                 text: c.text
             })),
             timestamp: Date.now(),
-            sequence: Date.now(),
+            sequence: nextSeq,
             user: cwmCurrentIdentity ? { 
                 userId: cwmCurrentIdentity.userId, 
                 userName: cwmCurrentIdentity.userName 
@@ -991,15 +992,40 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             return;
         }
 
+        // Global messageId de-duplication
+        if (msg.messageId) {
+            if (recentMessageIds.includes(msg.messageId)) {
+                console.log('[CodeWithMe] Duplicate messageId, ignoring', msg.messageId);
+                return;
+            }
+            recentMessageIds.push(msg.messageId);
+            if (recentMessageIds.length > 500) {
+                recentMessageIds.splice(0, recentMessageIds.length - 500);
+            }
+        }
+
         // Check sequence number for ordering
-        if (msg.sequence && msg.sequence <= lastProcessedSequence) {
-            console.log('[CodeWithMe] Received out-of-order message, ignoring');
+        const senderId = msg.originId || 'unknown';
+        let perSender = lastProcessedSeqByFileAndSender.get(filePath);
+        if (!perSender) {
+            perSender = new Map<string, number>();
+            lastProcessedSeqByFileAndSender.set(filePath, perSender);
+        }
+        const lastSeq = perSender.get(senderId) || 0;
+        if (typeof msg.sequence === 'number' && msg.sequence <= lastSeq) {
+            console.log('[CodeWithMe] Out-of-order/duplicate sequence, ignoring', { filePath, senderId, seq: msg.sequence, lastSeq });
             return;
         }
-        lastProcessedSequence = msg.sequence || Date.now();
+        if (typeof msg.sequence === 'number') {
+            perSender.set(senderId, msg.sequence);
+        }
 
-        isUpdatingFromRemote = true;
         updatingFromRemoteFiles.add(filePath);
+
+        // Create a confirmation promise that the onDidChangeTextDocument handler will resolve.
+        const confirmationPromise = new Promise<void>((resolve, reject) => {
+            editConfirmationPromises.set(filePath!, { resolve, reject });
+        });
 
         // Open or create the document on this side if needed
         let doc: vscode.TextDocument;
@@ -1043,26 +1069,30 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             }
         }
 
-        // Apply changes in a stable order to avoid shuffling:
-        // - Prefer ascending rangeOffset when available (reflects original document offsets)
-        // - Fallback to descending position order so earlier edits don't shift later ranges
-        const sorted = changesToApply.slice().sort((a, b) => {
-            const ao = a.rangeOffset ?? Number.POSITIVE_INFINITY;
-            const bo = b.rangeOffset ?? Number.POSITIVE_INFINITY;
-            if (ao !== bo) return ao - bo; // smaller offset first
-            // fallback: later positions first
-            if (a.range.start.line !== b.range.start.line) return b.range.start.line - a.range.start.line;
-            return b.range.start.character - a.range.start.character;
-        });
-
-        // Apply all valid changes in a single edit
-        for (const { range, text } of sorted) {
+        // Apply all valid changes in the sender-provided order to avoid reordering
+        for (const { range, text } of changesToApply) {
             edit.replace(doc.uri, range, text);
         }
 
         const success = await vscode.workspace.applyEdit(edit);
 
         if (success) {
+            // Wait for the onDidChangeTextDocument handler to confirm it saw the event.
+            // This is far more reliable than a fixed setTimeout.
+            const timeoutPromise = new Promise<void>((_, reject) => 
+                setTimeout(() => reject(new Error('Timeout waiting for edit confirmation event')), 1000)
+            );
+
+            try {
+                await Promise.race([confirmationPromise, timeoutPromise]);
+            } catch (e) {
+                console.warn(`[CodeWithMe] Did not receive edit confirmation for ${filePath}. The sync guard might be stale. Error:`, e);
+                // The promise might have been rejected by the timeout. Clean up the resolver.
+                const promiseControls = editConfirmationPromises.get(filePath);
+                promiseControls?.reject(e);
+            }
+
+
             // If we are the Host and this change originated from a Guest, forward it to other Guests
             if (role === 'Host' && ws && ws.readyState === WebSocket.OPEN) {
                 const fromGuest = msg.originId && msg.originId !== currentUserId;
@@ -1120,20 +1150,20 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
 
             updateSyncStatus(`${userName} edit applied`, '$(sync)');
         } else {
+            // If applyEdit failed, we must clean up the promise to prevent a memory leak.
+            const promiseControls = editConfirmationPromises.get(filePath);
+            promiseControls?.reject(new Error('applyEdit failed'));
             console.error(`[CodeWithMe] ${role}: Failed to apply edit for ${filePath}`);
             // Consider requesting a full resync for this file
         }
     } catch (error) {
         console.error(`[CodeWithMe] ${role}: Error handling file change:`, error);
     } finally {
-        // Use a small timeout to allow VS Code's event loop to settle before unlocking.
-        // This helps prevent race conditions where onDidChangeTextDocument fires before this `finally` block completes.
-        setTimeout(() => {
-            isUpdatingFromRemote = false;
-            if (filePath) {
-                updatingFromRemoteFiles.delete(filePath);
-            }
-        }, 200);
+        // This block ensures the guard and promise resolver are always cleaned up.
+        if (filePath) {
+            updatingFromRemoteFiles.delete(filePath);
+            editConfirmationPromises.delete(filePath);
+        }
     }
 }
 
@@ -1703,9 +1733,9 @@ async function openFileForGuest(filePath: string) {
 async function updateFileFromGuest(filePath: string, content: string) {
     try {
         console.log('[CodeWithMe] Host: Starting file update from guest:', filePath);
-        
+
         // CRITICAL: Set sync guard flag to prevent infinite loops
-        if (isUpdatingFromRemote) {
+        if (updatingFromRemoteFiles.has(filePath)) {
             console.log('[CodeWithMe] Host: Already updating from remote, skipping to prevent loop:', filePath);
             return;
         }
@@ -1718,7 +1748,7 @@ async function updateFileFromGuest(filePath: string, content: string) {
         }
         
         // Set guard flag before any file operations
-        isUpdatingFromRemote = true;
+        updatingFromRemoteFiles.add(filePath);
         
         // Update last processed content
         lastProcessedContent.set(filePath, content);
@@ -1818,7 +1848,7 @@ async function updateFileFromGuest(filePath: string, content: string) {
         vscode.window.showErrorMessage(`[CodeWithMe] Failed to update file from guest: ${path.basename(filePath)}`);
     } finally {
         // CRITICAL: Always reset the guard flag
-        isUpdatingFromRemote = false;
+        updatingFromRemoteFiles.delete(filePath);
         console.log('[CodeWithMe] Host: Reset sync guard flag after file update');
     }
 }
@@ -2043,8 +2073,7 @@ export function activate(context: vscode.ExtensionContext) {
             const choice = await vscode.window.showWarningMessage(
                 'End collaboration session?',
                 { modal: true },
-                'End session',
-                'Cancel'
+                'End session'
             );
             if (choice !== 'End session') {
                 return;
