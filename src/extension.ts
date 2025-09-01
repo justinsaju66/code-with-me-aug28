@@ -775,6 +775,7 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                 console.log(`[CodeWithMe] ${role}: Received session-stopped notification`);
                 cleanupSessionState();
                 if (role === 'Guest' && msg?.hostInitiated) {
+                    await discardAndCloseAllEditors();
                     vscode.window.showInformationMessage('Host ended the collaboration session.');
                     setTimeout(async () => {
                         try {
@@ -877,7 +878,15 @@ function setupEditorChangeListeners() {
         }
 
         const document = event.document;
-        const filePath = document.uri.fsPath;
+        // Prefer the original host path if this is an untitled guest document we mapped
+        let filePath = document.uri.fsPath;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === document) { filePath = hostPath; break; }
+                }
+            } catch {}
+        }
         const who = getDisplayUserName(currentRole || undefined as any);
 
         if (event.contentChanges && event.contentChanges.length > 0) {
@@ -931,6 +940,22 @@ function setupEditorChangeListeners() {
             }, BATCH_DELAY);
         }
     });
+
+    // Prevent guest from saving any file during a session
+    const onWillSaveDisp = vscode.workspace.onWillSaveTextDocument(async (event) => {
+        if (currentRole === 'guest') {
+            try {
+                vscode.window.showErrorMessage('Guests cannot save files during a collaboration session. Changes are not saved.');
+                // Ensure we revert the same document that is being saved
+                await vscode.window.showTextDocument(event.document, { preserveFocus: true, preview: false });
+                // Revert discards pending changes so the save becomes a no-op
+                await vscode.commands.executeCommand('workbench.action.files.revert');
+            } catch {}
+            // Do not provide edits; allow the (now clean) save to proceed as a no-op
+            event.waitUntil(Promise.resolve([]));
+        }
+    });
+    sessionDisposables.push(onWillSaveDisp);
 
     // Track cursor position changes
     const onSelDisp = vscode.window.onDidChangeTextEditorSelection(async (event) => {
@@ -1586,49 +1611,15 @@ async function openFileInGuestEditor(filePath: string) {
 async function openFileContentInGuestEditor(filePath: string, content: string) {
     try {
         console.log('[CodeWithMe] Guest: Opening file content in editor:', filePath);
-        
-        // Try to open the actual file path first
-        try {
-            // Create a URI for the file path
-            const fileUri = vscode.Uri.file(filePath);
-            
-            // Check if file exists, if not create it with the content
-            try {
-                await fs.access(filePath);
-                console.log('[CodeWithMe] Guest: File exists, opening directly:', filePath);
-            } catch {
-                console.log('[CodeWithMe] Guest: File does not exist, creating it:', filePath);
-                // Ensure directory exists
-                const dir = path.dirname(filePath);
-                await fs.mkdir(dir, { recursive: true });
-                // Create file with content
-                await fs.writeFile(filePath, content, 'utf8');
-            }
-            
-            // Open the actual file
-            const document = await vscode.workspace.openTextDocument(fileUri);
-            await vscode.window.showTextDocument(document);
-            
-            console.log('[CodeWithMe] Guest: File opened as actual file:', filePath);
-            vscode.window.showInformationMessage(`Opened ${path.basename(filePath)} for collaborative editing.`);
-            
-        } catch (fileError) {
-            console.log('[CodeWithMe] Guest: Could not open actual file, falling back to untitled:', fileError);
-            
-            // Fallback: create untitled document but track the mapping
-            const document = await vscode.workspace.openTextDocument({
-                content: content,
-                language: getLanguageFromPath(filePath)
-            });
-            
-            // Track the mapping between untitled document and file path
-            guestUntitledMap.set(filePath, document);
-            
-            await vscode.window.showTextDocument(document);
-            console.log('[CodeWithMe] Guest: File opened as untitled document with mapping');
-            vscode.window.showInformationMessage(`Opened ${path.basename(filePath)} (temporary file).`);
-        }
-        
+        // ALWAYS open guest view as untitled to avoid creating local files/folders
+        const document = await vscode.workspace.openTextDocument({
+            content: content,
+            language: getLanguageFromPath(filePath)
+        });
+        // Track mapping from host path to this untitled document
+        guestUntitledMap.set(filePath, document);
+        await vscode.window.showTextDocument(document, { preview: false });
+        console.log('[CodeWithMe] Guest: File opened as untitled document with mapping (no local file created)');
     } catch (error) {
         console.error('[CodeWithMe] Guest: Error opening file content in editor:', error);
         vscode.window.showErrorMessage(`[CodeWithMe] Failed to open file: ${path.basename(filePath)}`);
@@ -2333,6 +2324,22 @@ async function reloadWindowRobustly() {
     }
 }
 
+// Helper: discard unsaved changes and close all editors on guest
+async function discardAndCloseAllEditors() {
+    try {
+        const dirtyDocs = vscode.workspace.textDocuments.filter(d => d.isDirty);
+        for (const doc of dirtyDocs) {
+            try {
+                await vscode.window.showTextDocument(doc, { preserveFocus: true, preview: false });
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            } catch {}
+        }
+        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+    } catch (e) {
+        console.warn('[CodeWithMe] Guest cleanup: error closing editors', e);
+    }
+}
+
 // Fixed stopSession function
 async function stopSession(notifyOthers: boolean = true, initiatedBy: 'host' | 'guest' | 'auto' = 'auto') {
     if (!currentSession && !ws) return;
@@ -2371,6 +2378,11 @@ async function stopSession(notifyOthers: boolean = true, initiatedBy: 'host' | '
         }
         
         cleanupSessionState();
+        
+        // If a guest is stopping their own session, close all editors without prompts
+        if (actualRole === 'guest') {
+            await discardAndCloseAllEditors();
+        }
         
         // Always reload to ensure absolutely clean state for the next session (host or guest)
         console.log(`[CodeWithMe] Scheduling reload for ${actualRole}`);
