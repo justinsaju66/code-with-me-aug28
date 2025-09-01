@@ -2,7 +2,6 @@
   "name": "code-with-me",
   "displayName": "Code with me",
   "description": "Real-time collaborative coding extension inspired by VS Code Live Share",
-
   "version": "5.1.8",
   "publisher": "cybrosys",
   "engines": {
@@ -95,8 +94,8 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "20.x",
-    "@types/ws": "^8.5.11",
     "@types/vscode": "^1.70.0",
+    "@types/ws": "^8.5.11",
     "@typescript-eslint/eslint-plugin": "^8.31.1",
     "@typescript-eslint/parser": "^8.31.1",
     "@vscode/test-cli": "^0.0.11",

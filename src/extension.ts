@@ -857,14 +857,23 @@ function setupEditorChangeListeners() {
 
         // NEW: Robust promise-based guard.
         // If this change is a known remote edit, resolve the confirmation promise and stop.
-        if (updatingFromRemoteFiles.has(eventFilePath)) {
-            const promiseControls = editConfirmationPromises.get(eventFilePath);
+        // Map guest untitled documents back to their host path for guarding
+        let guardKey = eventFilePath;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === event.document) { guardKey = hostPath; break; }
+                }
+            } catch {}
+        }
+        if (updatingFromRemoteFiles.has(guardKey)) {
+            const promiseControls = editConfirmationPromises.get(guardKey);
             if (promiseControls) {
-                console.log(`[CodeWithMe] Confirmed remote edit for ${eventFilePath}, suppressing echo.`);
+                console.log(`[CodeWithMe] Confirmed remote edit for ${guardKey}, suppressing echo.`);
                 promiseControls.resolve();
                 // The promise is now fulfilled, but we leave the cleanup to the handleFileChange function
             } else {
-                console.warn(`[CodeWithMe] Guarded event fired for ${eventFilePath}, but no promise found.`);
+                console.warn(`[CodeWithMe] Guarded event fired for ${guardKey}, but no promise found.`);
             }
             return;
         }
@@ -1074,15 +1083,24 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             editConfirmationPromises.set(filePath!, { resolve, reject });
         });
 
-        // Open or create the document on this side if needed
+        // Resolve target document for applying remote edits
         let doc: vscode.TextDocument;
-        try {
-            doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
-        } catch {
-            // If a file doesn't exist, we can't apply partial changes.
-            // The host should send a 'file-content' message first for new files.
-            console.warn(`[CodeWithMe] Received file-change for a document not yet known: ${filePath}. A full 'file-content' message should precede this.`);
-            return;
+        if (role === 'Guest') {
+            const mapped = guestUntitledMap.get(filePath);
+            if (mapped) {
+                doc = mapped;
+            } else {
+                // We cannot apply partial changes without having opened the untitled doc from a prior 'file-content'
+                console.warn(`[CodeWithMe] Guest: No untitled document mapped for ${filePath}. Waiting for 'file-content' before applying deltas.`);
+                return;
+            }
+        } else {
+            try {
+                doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+            } catch {
+                console.warn(`[CodeWithMe] Host: Could not open ${filePath} for applying changes.`);
+                return;
+            }
         }
         
         // The new logic MUST use deltas (changes).
@@ -1211,7 +1229,9 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             }
 
             // Apply persistent decorations for this document
-            const editors = vscode.window.visibleTextEditors.filter(e => e.document.fileName === filePath);
+            const editors = role === 'Guest'
+                ? vscode.window.visibleTextEditors.filter(e => e.document === doc)
+                : vscode.window.visibleTextEditors.filter(e => e.document.fileName === filePath);
             for (const ed of editors) {
                 refreshOwnershipDecorations(ed);
             }
