@@ -49,6 +49,194 @@ interface ParticipantPermissions {
 let currentSession: CollaborationSession | null = null;
 let ws: WebSocket | null = null;
 let sessionStatusItem: vscode.StatusBarItem;
+let removedParticipantIds: Set<string> = new Set();
+let __cwm_wasHost: boolean = false;
+let sessionStartMs: number | null = null; // Shared timer start (host-sourced)
+let statusBarTimer: NodeJS.Timeout | null = null; // Ticks status bar every second when active
+
+function ensureSessionStatusItem() {
+    if (!sessionStatusItem) {
+        sessionStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
+        sessionStatusItem.command = 'code-with-me.showSessionMenu';
+    }
+}
+
+function refreshSessionStatusBar() {
+    ensureSessionStatusItem();
+    const isHost = (currentSession?.role === 'host' || currentRole === 'host');
+    const isGuest = (currentSession?.role === 'guest' || currentRole === 'guest');
+    const showEvenIfStopped = __cwm_wasHost && !isHost; // show in red after stop
+    if (!isHost && !isGuest && !showEvenIfStopped) {
+        sessionStatusItem.hide();
+        return;
+    }
+    const guestCount = currentSession?.participants ?
+        Array.from(currentSession.participants.values()).filter(p => p.id !== currentUserId && !removedParticipantIds.has(p.id)).length : 0;
+    const active = !!(ws && ws.readyState === WebSocket.OPEN && currentSession);
+    // Keep a ticking timer while active and we have a start time
+    if (active && sessionStartMs != null) {
+        if (!statusBarTimer) {
+            try { statusBarTimer = setInterval(() => refreshSessionStatusBar(), 1000); } catch {}
+        }
+    } else {
+        if (statusBarTimer) { try { clearInterval(statusBarTimer); } catch {} statusBarTimer = null; }
+    }
+    // Allow overriding codicon via configuration
+    const cfg = vscode.workspace.getConfiguration('code-with-me');
+    const compact: boolean = !!cfg.get<boolean>('statusBarCompact');
+    const clickAction: string = (cfg.get<string>('statusBarClickAction') || 'menu'); // 'menu' | 'stop'
+    const customCodicon = cfg.get<string>('statusBarCodicon');
+    const iconActive = customCodicon || 'broadcast';
+    const iconStopped = 'circle-slash';
+    const formatElapsed = (start: number | null) => {
+        if (!start) return '';
+        const total = Math.max(0, Math.floor((Date.now() - start) / 1000));
+        const h = Math.floor(total / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        const s = total % 60;
+        const pad = (n: number) => n.toString().padStart(2, '0');
+        return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+    };
+    // Normalize optional logo to a proper URI (supports local paths and http/https/file URIs)
+    const logoRaw = cfg.get<string>('statusBarLogo');
+    let logoUri: string | undefined;
+    if (logoRaw && typeof logoRaw === 'string') {
+        try {
+            if (logoRaw.startsWith('http://') || logoRaw.startsWith('https://') || logoRaw.startsWith('file:')) {
+                logoUri = logoRaw;
+            } else {
+                logoUri = vscode.Uri.file(logoRaw).toString();
+            }
+        } catch {
+            // ignore invalid paths
+        }
+    }
+    if (active) {
+        if (isHost) {
+            sessionStatusItem.text = compact
+                ? `$(${iconActive})`
+                : `$(${iconActive}) Hosting Code With Me (${guestCount})${sessionStartMs != null ? ` • ${formatElapsed(sessionStartMs)}` : ''}`;
+            // Tooltip: support optional logo image via config (statusBarLogo)
+            if (logoUri) {
+                const md = new vscode.MarkdownString();
+                md.isTrusted = false;
+                md.appendMarkdown(`![logo](${logoUri}|height=16)\n`);
+                md.appendText(`Hosting session${guestCount ? ` • ${guestCount} participant(s)` : ' • waiting for guests'}`);
+                sessionStatusItem.tooltip = md;
+            } else {
+                sessionStatusItem.tooltip = `Hosting session${guestCount ? ` • ${guestCount} participant(s)` : ' • waiting for guests'}`;
+            }
+            // Color logic: red until a guest joins, green after at least one guest
+            sessionStatusItem.color = new vscode.ThemeColor(guestCount > 0 ? 'charts.green' : 'charts.red');
+            // Click action when hosting
+            sessionStatusItem.command = (clickAction === 'stop') ? 'code-with-me.stopSession' : 'code-with-me.showSessionMenu';
+        } else if (isGuest) {
+            // Show connected state for guests, in green, with a Leave action
+            const guestIcon = 'pass'; // checkmark-like icon
+            sessionStatusItem.text = compact
+                ? `$(${guestIcon})`
+                : `$(${guestIcon}) Connected to Host${sessionStartMs != null ? ` • ${formatElapsed(sessionStartMs)}` : ''}`;
+            sessionStatusItem.tooltip = 'Connected to Host — Click to leave the session';
+            sessionStatusItem.color = new vscode.ThemeColor('charts.green');
+            sessionStatusItem.command = 'code-with-me.stopSession'; // acts as Leave session for guests
+        }
+    } else {
+        // When stopped, show icon-only to avoid the "stopped" label as requested
+        sessionStatusItem.text = `$(${iconStopped})`;
+        if (logoUri) {
+            const md = new vscode.MarkdownString();
+            md.isTrusted = false;
+            md.appendMarkdown(`![logo](${logoUri}|height=16)\n`);
+            md.appendText('Session stopped');
+            sessionStatusItem.tooltip = md;
+        } else {
+            sessionStatusItem.tooltip = 'Session stopped';
+        }
+        sessionStatusItem.color = new vscode.ThemeColor('charts.red');
+        // When stopped, clicking opens the menu
+        sessionStatusItem.command = 'code-with-me.showSessionMenu';
+    }
+    sessionStatusItem.show();
+}
+
+async function showHostSessionMenu() {
+    const isHost = (currentSession?.role === 'host' || currentRole === 'host');
+    if (!isHost) {
+        vscode.window.showInformationMessage('Only the host can manage the session.');
+        return;
+    }
+    const participants = currentSession?.participants ? Array.from(currentSession.participants.values()) : [];
+
+    // Inline one-line Remove via QuickPick item buttons
+    const qp = vscode.window.createQuickPick();
+    qp.title = 'Code With Me — Host controls';
+    qp.matchOnDescription = true;
+    qp.matchOnDetail = true;
+
+    const makeItem = (p: any): (vscode.QuickPickItem & { detail?: string; buttons?: vscode.QuickInputButton[] }) => {
+        const blocked = removedParticipantIds.has(p.id);
+        const buttons: vscode.QuickInputButton[] = [
+            { iconPath: new vscode.ThemeIcon('trash'), tooltip: 'Remove' }
+        ];
+        return {
+            label: `${blocked ? '$(circle-slash) ' : ''}${p.name || p.id}`,
+            description: blocked ? '(removed/blocked)' : undefined,
+            detail: p.id,
+            buttons
+        } as any;
+    };
+
+    const itemsWithButtons: (vscode.QuickPickItem & { detail?: string; buttons?: vscode.QuickInputButton[] })[] = [];
+    for (const p of participants) {
+        if (p.id === currentUserId) { continue; }
+        itemsWithButtons.push(makeItem(p));
+    }
+    if (itemsWithButtons.length === 0) {
+        itemsWithButtons.push({ label: 'No guests connected', description: undefined } as any);
+    }
+    itemsWithButtons.push({ label: '$(debug-stop) Stop session', description: 'End collaboration session' } as any);
+    qp.items = itemsWithButtons;
+
+    const disposeAll = () => { try { qp.dispose(); } catch {} };
+
+    qp.onDidTriggerItemButton(async (e) => {
+        const id = (e.item as any).detail as string | undefined;
+        if (!id) { return; }
+        const name = participants.find(p => p.id === id)?.name || id;
+        const confirm = await vscode.window.showWarningMessage(`Remove ${name} from the session?`, { modal: true }, 'Remove');
+        if (confirm !== 'Remove') { return; }
+        try {
+            removedParticipantIds.add(id);
+            currentSession?.participants?.delete(id);
+            refreshSessionStatusBar();
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'kick-guest', participantId: id, guestId: id, reason: 'removed_by_host', timestamp: Date.now() }));
+            }
+            vscode.window.showInformationMessage(`${name} has been removed and disconnected.`);
+            // Refresh list
+            const updated = currentSession?.participants ? Array.from(currentSession.participants.values()) : [];
+            qp.items = updated.filter(p => p.id !== currentUserId).map(makeItem) as any;
+        } catch (e) {
+            vscode.window.showErrorMessage('Failed to remove participant');
+        }
+    });
+
+    qp.onDidAccept(async () => {
+        const choice = qp.selectedItems[0];
+        if (!choice) { disposeAll(); return; }
+        if (choice.label.startsWith('$(debug-stop)')) {
+            disposeAll();
+            await vscode.commands.executeCommand('code-with-me.stopSession');
+            refreshSessionStatusBar();
+            return;
+        }
+        // Ignore selecting participant rows (remove is via button)
+        disposeAll();
+    });
+
+    qp.onDidHide(() => disposeAll());
+    qp.show();
+}
 let participantStatusItem: vscode.StatusBarItem;
 let syncStatusItem: vscode.StatusBarItem;
 let currentUserId: string = crypto.randomUUID();
@@ -87,6 +275,33 @@ const editConfirmationPromises = new Map<string, { resolve: () => void, reject: 
 const attributionDecorationTypes: Map<string, vscode.TextEditorDecorationType> = new Map();
 // Map<filePath, Map<lineNumber, { userName: string }>>
 const lineOwnership: Map<string, Map<number, { userName: string }>> = new Map();
+
+// Auto-reload guards on unexpected disconnects
+let __cwm_reloadScheduled: boolean = false;
+let __cwm_reloadBackoffMs: number = 1000; // start with 1s
+const __cwm_reloadBackoffMaxMs: number = 8000; // cap at 8s
+function scheduleReload(reason: string) {
+    try {
+        if (__cwm_reloadScheduled) { return; }
+        // Do not auto-reload if user explicitly stopped the session
+        if (isStopping) { return; }
+        __cwm_reloadScheduled = true;
+        console.log(`[CodeWithMe] Scheduling window reload due to ${reason} in ${__cwm_reloadBackoffMs}ms`);
+        const delay = __cwm_reloadBackoffMs;
+        __cwm_reloadBackoffMs = Math.min(__cwm_reloadBackoffMs * 2, __cwm_reloadBackoffMaxMs);
+        setTimeout(() => {
+            try {
+                // reset the flag just before reload attempt
+                __cwm_reloadScheduled = false;
+                vscode.commands.executeCommand('workbench.action.reloadWindow');
+            } catch (e) {
+                console.error('[CodeWithMe] Failed to execute reloadWindow command', e);
+            }
+        }, delay);
+    } catch (e) {
+        console.error('[CodeWithMe] scheduleReload error', e);
+    }
+}
 // Cache: compact header labels per user (one label per contiguous block)
 /* Per-user compact header decorations (one label per contiguous block) */
 const headerDecorationTypes: Map<string, vscode.TextEditorDecorationType> = new Map();
@@ -181,7 +396,15 @@ function updateParticipantCursors() {
 
     for (const [id, cursor] of participantCursors.entries()) {
         // Only draw if the cursor is in the currently active file
-        if (cursor.filePath === editor.document.uri.fsPath) {
+        let currentEditorHostPath = editor.document.uri.fsPath;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === editor.document) { currentEditorHostPath = hostPath; break; }
+                }
+            } catch {}
+        }
+        if (cursor.filePath === currentEditorHostPath) {
             const userName = cursor.user?.userName || 'Guest';
             const decorationType = getParticipantCursorDecoration(id, userName);
             const range = new vscode.Range(cursor.position, cursor.position);
@@ -198,14 +421,14 @@ function hashCode(s: string): number {
 }
 function getUserDecoration(userName: string): vscode.TextEditorDecorationType {
     if (attributionDecorationTypes.has(userName)) return attributionDecorationTypes.get(userName)!;
-    const hue = Math.abs(hashCode(userName)) % 360;
-    const color = `hsl(${hue}, 85%, 60%)`;
+    // Unified blue color for all ownership highlights
+    const color = '#2F81F7'; // blue
     const deco = vscode.window.createTextEditorDecorationType({
         isWholeLine: true,
-        backgroundColor: `${color}1A`,
+        backgroundColor: 'rgba(47, 129, 247, 0.10)',
         overviewRulerColor: color,
         overviewRulerLane: vscode.OverviewRulerLane.Right,
-        borderColor: `${color}66`,
+        borderColor: 'rgba(47, 129, 247, 0.40)',
         borderWidth: '1px 0 0 0',
         borderStyle: 'solid'
     });
@@ -226,8 +449,8 @@ function getHeaderDecoration(userName: string): vscode.TextEditorDecorationType 
             contentText: '',
             // place at end of line: small margin to the right and slight vertical lift
             margin: '-0.2em 0 0 6px',
-            color: '#c7ccd1',
-            backgroundColor: 'rgba(60, 65, 70, 0.75)',
+            color: '#2F81F7',
+            backgroundColor: 'rgba(47, 129, 247, 0.15)',
             textDecoration: `
                 none;
                 font-weight: 500;
@@ -247,7 +470,15 @@ function getHeaderDecoration(userName: string): vscode.TextEditorDecorationType 
 // Apply persistent per-line ownership decorations to an editor
 function refreshOwnershipDecorations(editor: vscode.TextEditor) {
     try {
-        const filePath = editor.document.fileName;
+        // Resolve host path for guest untitled docs so our lineOwnership map matches
+        let filePath = editor.document.fileName;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === editor.document) { filePath = hostPath; break; }
+                }
+            } catch {}
+        }
         const map = lineOwnership.get(filePath);
 
         // Clear previously applied ownership decorations
@@ -264,6 +495,8 @@ function refreshOwnershipDecorations(editor: vscode.TextEditor) {
             arr.push(line);
             perUserLines.set(meta.userName, arr);
         }
+
+        // Show ownership labels for all contributors (host and guests) on both sides
 
         // 2) For each user, sort and compress into contiguous blocks
         for (const [userName, lines] of perUserLines.entries()) {
@@ -496,6 +729,46 @@ async function setupJetBrainsStyleCollaboration(url: string, role: 'Host' | 'Gue
                 timestamp: Date.now()
             }));
 
+            // Initialize currentSession so status bar and menus can reflect state
+            try {
+                const sessionIdFromUrl = (() => {
+                    try { return new URL(url).pathname.split('/').filter(Boolean).pop() || ''; } catch { return ''; }
+                })();
+                const sharedWorkspace = vscode.workspace.workspaceFolders?.[0] as vscode.WorkspaceFolder;
+                currentSession = {
+                    sessionId: sessionIdFromUrl,
+                    role: (role.toLowerCase() as 'host' | 'guest'),
+                    participants: new Map<string, Participant>(),
+                    sharedWorkspace,
+                    permissions: (role === 'Host' ? (hostSessionPermissions as SessionPermissions) : (guestSessionPermissions as SessionPermissions)) || {
+                        allowGuestEdit: true,
+                        allowGuestDebug: false,
+                        allowGuestTerminal: false,
+                        allowGuestFileCreate: true,
+                        allowGuestFileDelete: false,
+                    }
+                };
+                // Add self to participant map for reference (filtered from guest count by id)
+                currentSession.participants.set(currentUserId, {
+                    id: currentUserId,
+                    name: getDisplayUserName(currentRole || undefined as any),
+                    role: (role.toLowerCase() as 'host' | 'guest'),
+                    permissions: {
+                        canEdit: true,
+                        canDebug: false,
+                        canAccessTerminal: false,
+                        canCreateFiles: true,
+                        canDeleteFiles: false,
+                        canViewFiles: true,
+                    },
+                    lastSeen: new Date()
+                } as Participant);
+            } catch (e) {
+                console.warn('[CodeWithMe] Failed to initialize currentSession on open', e);
+            }
+            // Show initial status (red until a guest joins)
+            try { refreshSessionStatusBar(); } catch {}
+
             if (role === 'Host') {
                 await setupHostCollaborativeSession();
                 vscode.window.showInformationMessage('Host session started. Share the invite link with collaborators.');
@@ -508,7 +781,12 @@ async function setupJetBrainsStyleCollaboration(url: string, role: 'Host' | 'Gue
                 await setupGuestCollaborativeSession();
                 vscode.window.showInformationMessage('Connected to host. You can now collaborate in real-time.');
                 // Handshake: guest announces presence; DO NOT require explicit request for workspace
-                const helloMsg = { type: 'hello-guest', guestId: currentUserId, timestamp: Date.now() };
+                const helloMsg = { 
+                    type: 'hello-guest', 
+                    guestId: currentUserId, 
+                    userName: getDisplayUserName('guest'),
+                    timestamp: Date.now() 
+                };
                 try {
                     ws!.send(JSON.stringify(helloMsg));
                     console.log('[CodeWithMe] Guest: Sent hello-guest handshake');
@@ -527,18 +805,44 @@ async function setupJetBrainsStyleCollaboration(url: string, role: 'Host' | 'Gue
             }
         };
         
-        ws.onerror = (error: any) => {
+        ws.onerror = async (error: any) => {
             console.error(`[CodeWithMe] ${role}: WebSocket error:`, error);
             vscode.window.showErrorMessage(`Connection failed. Make sure the server is running.`);
+            // Perform same cleanup as guest stop flow so no editors linger
+            try {
+                cleanupSessionState();
+                if ((currentRole || role.toLowerCase()) === 'guest') {
+                    await discardAndCloseAllEditors();
+                }
+            } catch (e) {
+                console.warn('[CodeWithMe] Cleanup on error failed', e);
+            }
+            // Auto-reload on any socket error (network drop, host crash, etc.)
+            scheduleReload('socket-error');
         };
         
-        ws.onclose = () => {
+        ws.onclose = async () => {
             console.log(`[CodeWithMe] ${role}: WebSocket connection closed`);
             vscode.window.showWarningMessage('Session disconnected.');
+            // Perform same cleanup as guest stop flow so no editors linger
+            try {
+                cleanupSessionState();
+                if ((currentRole || role.toLowerCase()) === 'guest') {
+                    await discardAndCloseAllEditors();
+                }
+            } catch (e) {
+                console.warn('[CodeWithMe] Cleanup on close failed', e);
+            }
+            // Auto-reload on close to recover from disconnections
+            scheduleReload('socket-closed');
         };
         
         ws.onmessage = async (event: any) => {
             try {
+                const normalizeParticipantId = (s?: string) => {
+                    if (!s) return s;
+                    return s.replace(/^(guest-|host-)/, '');
+                };
                 // Normalize to string
                 let text: string;
                 if (event.data instanceof Blob) {
@@ -556,22 +860,82 @@ async function setupJetBrainsStyleCollaboration(url: string, role: 'Host' | 'Gue
                     return;
                 }
 
-                // Host: push workspace-info immediately after hello-guest
-                if (role === 'Host' && msg?.type === 'hello-guest') {
-                    console.log('[CodeWithMe] Host: Received hello-guest from', msg.guestId, '- sending workspace-info');
+                // Some servers wrap actual payload under msg.data
+                const payload = (msg && typeof msg === 'object' && msg.data && typeof msg.data === 'object' && msg.data.type)
+                    ? msg.data
+                    : msg;
+
+                // Host: on hello-guest, register participant immediately and push workspace-info
+                if (role === 'Host' && payload?.type === 'hello-guest') {
+                    console.log('[CodeWithMe] Host: Received hello-guest from', (payload.guestId || payload.participantId), '- sending workspace-info');
+                    try {
+                        if (currentSession && currentSession.participants) {
+                            const pid = (payload.participantId || payload.guestId) as string | undefined;
+                            if (!pid) { await sendWorkspaceInfo(); return; }
+                            if (pid === currentUserId) { await sendWorkspaceInfo(); return; }
+                            // If this participant was previously removed/blocked, immediately kick again and do not add
+                            if (removedParticipantIds.has(pid)) {
+                                console.log('[CodeWithMe] Host: hello-guest from removed participant, re-kicking:', pid);
+                                try { ws?.send(JSON.stringify({ type: 'kick-guest', participantId: pid, guestId: pid, reason: 'removed_by_host', timestamp: Date.now() })); } catch {}
+                                await sendWorkspaceInfo();
+                                return;
+                            }
+                            const name = payload.userName || pid;
+                            // Idempotent: if already present, update name/lastSeen and skip duplicate insert
+                            const existing = currentSession.participants.get(pid);
+                            if (existing) {
+                                existing.name = name;
+                                existing.lastSeen = new Date();
+                                currentSession.participants.set(pid, existing);
+                                refreshSessionStatusBar();
+                                await sendWorkspaceInfo();
+                                return;
+                            }
+                            currentSession.participants.set(pid, {
+                                id: pid,
+                                name,
+                                role: 'guest',
+                                permissions: {
+                                    canEdit: !!hostSessionPermissions?.allowGuestEdit,
+                                    canDebug: !!hostSessionPermissions?.allowGuestDebug,
+                                    canAccessTerminal: !!hostSessionPermissions?.allowGuestTerminal,
+                                    canCreateFiles: !!hostSessionPermissions?.allowGuestFileCreate,
+                                    canDeleteFiles: !!hostSessionPermissions?.allowGuestFileDelete,
+                                    canViewFiles: true,
+                                },
+                                lastSeen: new Date()
+                            } as Participant);
+                            refreshSessionStatusBar(); // turn green when first guest arrives
+                            vscode.window.showInformationMessage(`${name} joined the session`);
+                        }
+                    } catch (e) {
+                        console.warn('[CodeWithMe] Host: Failed to register guest on hello-guest', e);
+                    }
                     await sendWorkspaceInfo();
                     return;
                 }
 
                 // Guest: if workspace-info arrives, populate the Explorer view immediately
-                if (role === 'Guest' && msg?.type === 'workspace-info' && codeWithMeTreeProvider) {
-                    const payload = msg.data ?? msg;
-                    if (Array.isArray(payload?.tree)) {
-                        codeWithMeTreeProvider.setTree(payload.tree);
+                if (role === 'Guest' && payload?.type === 'workspace-info' && codeWithMeTreeProvider) {
+                    const treeMsg = payload;
+                    if (Array.isArray(treeMsg?.tree)) {
+                        codeWithMeTreeProvider.setTree(treeMsg.tree);
                         // Focus once so the user sees it
                         try { await vscode.commands.executeCommand('code-with-me-explorer.focus'); } catch {}
                         console.log('[CodeWithMe] Guest: Populated Explorer tree from onmessage');
                     }
+                }
+
+                // Guest: if host removes this guest, end only this guest's session.
+                // The relay logs show kick-guest is sent to exactly 1 recipient; therefore it's safe to stop unconditionally on guest receipt.
+                if (role === 'Guest' && ((payload?.type === 'kick-guest') || (msg?.type === 'kick-guest'))) {
+                    console.log('[CodeWithMe] Guest: received kick-guest -> stopping guest session');
+                    try {
+                        vscode.window.showWarningMessage('You were removed from the session by the host.');
+                    } finally {
+                        try { await vscode.commands.executeCommand('code-with-me.stopSession', true); } catch {}
+                    }
+                    return;
                 }
 
                 // Delegate remaining handling
@@ -899,6 +1263,27 @@ function setupEditorChangeListeners() {
         const who = getDisplayUserName(currentRole || undefined as any);
 
         if (event.contentChanges && event.contentChanges.length > 0) {
+            // Guard: if guest discards an untitled buffer, VS Code may emit a single change
+            // that clears the entire document before closing. Suppress broadcasting that.
+            if (currentRole === 'guest') {
+                let isGuestUntitled = false;
+                try {
+                    for (const [, doc] of guestUntitledMap.entries()) {
+                        if (doc === document) { isGuestUntitled = true; break; }
+                    }
+                } catch {}
+                if (isGuestUntitled && event.contentChanges.length === 1) {
+                    const ch = event.contentChanges[0];
+                    const prevLen = (lastProcessedContent.get(filePath) || '').length;
+                    const isFullClear = ch.rangeOffset === 0 && ch.rangeLength === prevLen && ch.text === '';
+                    if (isFullClear) {
+                        console.log('[CodeWithMe] Suppressing discard-induced clear for guest untitled doc', { filePath, prevLen });
+                        // Update tracked content to empty, but do not send
+                        lastProcessedContent.set(filePath, '');
+                        return;
+                    }
+                }
+            }
             console.log('[CodeWithMe] onDidChangeTextDocument: PROCESS local changes', {
                 file: filePath,
                 changes: event.contentChanges.length
@@ -917,9 +1302,18 @@ function setupEditorChangeListeners() {
             }
 
             // Update UI
-            vscode.window.visibleTextEditors
-                .filter(e => e.document.fileName === filePath)
-                .forEach(e => refreshOwnershipDecorations(e));
+            try {
+                let editors: vscode.TextEditor[] = [];
+                if (currentRole === 'guest') {
+                    const mappedDoc = guestUntitledMap.get(filePath);
+                    if (mappedDoc) {
+                        editors = vscode.window.visibleTextEditors.filter(e => e.document === mappedDoc);
+                    }
+                } else {
+                    editors = vscode.window.visibleTextEditors.filter(e => e.document.fileName === filePath);
+                }
+                editors.forEach(e => refreshOwnershipDecorations(e));
+            } catch {}
 
             // Batch changes
             if (!pendingChanges.has(filePath)) {
@@ -938,6 +1332,8 @@ function setupEditorChangeListeners() {
             }));
             
             pendingChanges.get(filePath)!.push(...changes);
+            // Update last known content after applying local change
+            try { lastProcessedContent.set(filePath, document.getText()); } catch {}
             
             // Clear any existing timeout and set a new one
             if (batchTimeout) {
@@ -970,9 +1366,18 @@ function setupEditorChangeListeners() {
     const onSelDisp = vscode.window.onDidChangeTextEditorSelection(async (event) => {
         console.count('[CodeWithMe] onDidChangeTextEditorSelection fired');
         if (ws && ws.readyState === 1) {
+            // Map guest untitled doc back to host path
+            let selFilePath = event.textEditor.document.uri.fsPath;
+            if (currentRole === 'guest') {
+                try {
+                    for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                        if (doc === event.textEditor.document) { selFilePath = hostPath; break; }
+                    }
+                } catch {}
+            }
             ws.send(JSON.stringify({
                 type: 'cursor-position',
-                filePath: event.textEditor.document.uri.fsPath,
+                filePath: selFilePath,
                 position: { line: event.selections[0].active.line, character: event.selections[0].active.character },
                 timestamp: Date.now(),
                 user: cwmCurrentIdentity ? { 
@@ -1294,6 +1699,10 @@ async function handleWorkspaceInfo(msg: any) {
         countFiles(info.tree);
         console.log(`[CodeWithMe] Guest: Workspace "${info.name}" at ${info.path} with ${fileCount} files`);
 
+        // Sync session start for shared timer
+        try { if (typeof info.sessionStartMs === 'number') { sessionStartMs = info.sessionStartMs; } } catch {}
+        // Ensure guest status bar updates immediately and timer starts ticking
+        try { refreshSessionStatusBar(); } catch {}
         // Cache workspace for quick-pick
         (global as any).__cwm_lastWorkspaceInfo = info;
 
@@ -1317,11 +1726,14 @@ async function sendWorkspaceInfo() {
             console.log('[CodeWithMe] Host: Getting workspace tree for guest...');
             const tree = await getWorkspaceFiles(workspaceRoot.uri.fsPath);
             
+            // Initialize session start on first send
+            if (sessionStartMs == null) { sessionStartMs = Date.now(); }
             const workspaceInfo = {
                 name: workspaceRoot.name,
                 path: workspaceRoot.uri.fsPath,
                 tree: tree,
-                permissions: hostSessionPermissions
+                permissions: hostSessionPermissions,
+                sessionStartMs
             };
             
             const message = JSON.stringify({
@@ -1350,13 +1762,52 @@ function broadcastWorkspaceState() {
 
 // Handle participant events
 async function handleParticipantJoined(msg: any) {
-    const userName = msg.userName || msg.participantId;
-    console.log(`[CodeWithMe] Participant joined: ${userName} (${msg.participantId})`);
-    vscode.window.showInformationMessage(`${userName} joined the session`);
+    const pid = (msg.participantId || msg.guestId) as string | undefined;
+    const userName = msg.userName || pid;
+    console.log(`[CodeWithMe] Participant joined: ${userName} (${pid})`);
+    let isNew = false;
+    // Update participants map if present, idempotently
+    try {
+        if (currentSession && currentSession.participants && pid) {
+            const existing = currentSession.participants.get(pid);
+            if (existing) {
+                existing.name = userName;
+                existing.lastSeen = new Date();
+                currentSession.participants.set(pid, existing);
+            } else {
+                currentSession.participants.set(pid, {
+                    id: pid,
+                    name: userName,
+                    role: 'guest',
+                    permissions: {
+                        canEdit: true,
+                        canDebug: false,
+                        canAccessTerminal: false,
+                        canCreateFiles: true,
+                        canDeleteFiles: false,
+                        canViewFiles: true,
+                    },
+                    lastSeen: new Date()
+                } as Participant);
+                isNew = true;
+            }
+        }
+    } catch {}
+    refreshSessionStatusBar();
+    if (isNew && userName) {
+        vscode.window.showInformationMessage(`${userName} joined the session`);
+    }
 }
 
 async function handleParticipantLeft(msg: any) {
     console.log('[CodeWithMe] Participant left:', msg.participantId);
+    // Remove from participants map
+    try {
+        if (currentSession && currentSession.participants && msg.participantId) {
+            currentSession.participants.delete(msg.participantId);
+        }
+    } catch {}
+    refreshSessionStatusBar();
     vscode.window.showInformationMessage(`${msg.participantId} left the session`);
     participantCursors.delete(msg.participantId);
     // NEW: Clean up decorations for the participant who left
@@ -1631,15 +2082,35 @@ async function openFileInGuestEditor(filePath: string) {
 async function openFileContentInGuestEditor(filePath: string, content: string) {
     try {
         console.log('[CodeWithMe] Guest: Opening file content in editor:', filePath);
-        // ALWAYS open guest view as untitled to avoid creating local files/folders
-        const document = await vscode.workspace.openTextDocument({
-            content: content,
-            language: getLanguageFromPath(filePath)
-        });
+        // Open as a NAMED untitled document so the tab shows the real filename
+        const title = path.basename(filePath);
+        const uri = vscode.Uri.parse(`untitled:${title}`);
+        const document = await vscode.workspace.openTextDocument(uri);
+        // Set language mode based on the original path
+        try { await vscode.languages.setTextDocumentLanguage(document, getLanguageFromPath(filePath)); } catch {}
+
+        const editor = await vscode.window.showTextDocument(document, { preview: false });
+
+        // Insert initial content programmatically, guarded to avoid echoing as a local change
+        updatingFromRemoteFiles.add(filePath);
+        try {
+            const ok = await editor.edit((eb) => {
+                eb.insert(new vscode.Position(0, 0), content);
+            }, { undoStopBefore: false, undoStopAfter: false });
+            if (!ok) {
+                console.warn('[CodeWithMe] Guest: Failed to insert initial content for', filePath);
+            }
+        } finally {
+            updatingFromRemoteFiles.delete(filePath);
+        }
+
         // Track mapping from host path to this untitled document
         guestUntitledMap.set(filePath, document);
-        await vscode.window.showTextDocument(document, { preview: false });
-        console.log('[CodeWithMe] Guest: File opened as untitled document with mapping (no local file created)');
+        // Initialize last known content for suppression heuristics
+        try { lastProcessedContent.set(filePath, content); } catch {}
+        // Ensure decorations/UI render immediately for guest
+        try { refreshOwnershipDecorations(editor); } catch {}
+        console.log('[CodeWithMe] Guest: File opened as named untitled document with mapping (no local file created)');
     } catch (error) {
         console.error('[CodeWithMe] Guest: Error opening file content in editor:', error);
         vscode.window.showErrorMessage(`[CodeWithMe] Failed to open file: ${path.basename(filePath)}`);
@@ -1974,7 +2445,7 @@ export function activate(context: vscode.ExtensionContext) {
     
     console.log('[CodeWithMe] Status bar item created and shown');
     
-    // Ensure the Code with me Explorer view is registered immediately
+    // Ensure the Code with me Explorer view is registered (once)
     try {
         if (!codeWithMeTreeProvider) {
             codeWithMeTreeProvider = new CodeWithMeTreeProvider();
@@ -1988,21 +2459,6 @@ export function activate(context: vscode.ExtensionContext) {
     } catch (e) {
         console.error('[CodeWithMe] Failed to register Explorer view:', e);
     }
-    
-   // Register the Code with me Explorer tree view and its open command first
-   try {
-       if (!codeWithMeTreeProvider) {
-           codeWithMeTreeProvider = new CodeWithMeTreeProvider();
-       }
-       const treeView = vscode.window.createTreeView('code-with-me-explorer', {
-           treeDataProvider: codeWithMeTreeProvider,
-           showCollapseAll: true
-       });
-       context.subscriptions.push(treeView);
-       console.log('[CodeWithMe] Explorer view registered on activate');
-   } catch (e) {
-       console.error('[CodeWithMe] Failed to register Explorer view:', e);
-   }
    // Command used by Explorer file nodes
    const openFromExplorerCmd = vscode.commands.registerCommand('code-with-me.openFromExplorer', async (node: any) => {
        try {
@@ -2020,14 +2476,14 @@ export function activate(context: vscode.ExtensionContext) {
            // Mirror the exact quick-pick flow: host opens and immediately streams file-content
            ws.send(JSON.stringify({ type: 'open-file', filePath: n.path }));
            console.log('[CodeWithMe] Guest: open-file sent from Explorer for', n.path);
-       } catch (e) {
-           console.error('[CodeWithMe] openFromExplorer failed:', e);
-       }
-   });
-   context.subscriptions.push(openFromExplorerCmd);
+        } catch (e) {
+            console.error('[CodeWithMe] openFromExplorer failed:', e);
+        }
+    });
+    context.subscriptions.push(openFromExplorerCmd);
 
-   // Register commands
-   let startSessionDisposable = vscode.commands.registerCommand('code-with-me.startSession', async () => {
+    // Register commands
+    let startSessionDisposable = vscode.commands.registerCommand('code-with-me.startSession', async () => {
         // Require GitHub sign-in before starting session
         const identity = await ensureGitHubSession(true);
         if (!identity) {
@@ -2061,11 +2517,16 @@ export function activate(context: vscode.ExtensionContext) {
         lastSessionUrl = `${DEFAULT_PUBLIC_WS_URL}/${sessionId}`;
 
         await setupJetBrainsStyleCollaboration(lastSessionUrl, 'Host');
+        // Set shared session start time
+        sessionStartMs = Date.now();
+        __cwm_wasHost = true;
+        refreshSessionStatusBar();
         // After a short delay (guest likely connected), resend workspace info
         setTimeout(() => {
             try { sendWorkspaceInfo(); } catch (e) { console.log('[CodeWithMe] Host: resend workspace info failed', e); }
         }, 1000);
         await shareSessionLink();
+        refreshSessionStatusBar();
     });
     
     let joinSessionDisposable = vscode.commands.registerCommand('code-with-me.joinSession', async () => {
@@ -2119,25 +2580,45 @@ export function activate(context: vscode.ExtensionContext) {
         }
     });
     
-    let stopSessionDisposable = vscode.commands.registerCommand('code-with-me.stopSession', async () => {
+    let stopSessionDisposable = vscode.commands.registerCommand('code-with-me.stopSession', async (skipConfirm?: boolean) => {
         const roleNow: 'host' | 'guest' | null = currentSession?.role ?? currentRole;
         const isHost = roleNow === 'host';
 
         if (isHost) {
-            const choice = await vscode.window.showWarningMessage(
-                'End collaboration session?',
-                { modal: true },
-                'End session'
-            );
-            if (choice !== 'End session') {
-                return;
+            if (!skipConfirm) {
+                const choice = await vscode.window.showWarningMessage(
+                    'End collaboration session?',
+                    { modal: true },
+                    'End session'
+                );
+                if (choice !== 'End session') {
+                    return;
+                }
             }
             vscode.window.showInformationMessage('[CodeWithMe] Stopping session...');
             await stopSession(true, 'host');
+            refreshSessionStatusBar();
         } else {
+            // Guest: allow forced stop without confirmation (e.g., when kicked by host)
+            if (!skipConfirm) {
+                const choice = await vscode.window.showWarningMessage(
+                    'Leave Code With Me session?',
+                    { modal: true },
+                    'Leave session'
+                );
+                if (choice !== 'Leave session') {
+                    return;
+                }
+            }
             vscode.window.showInformationMessage('[CodeWithMe] Leaving session...');
             await stopSession(true, 'guest');
+            refreshSessionStatusBar();
         }
+    });
+    
+    // Show session (host) menu: list guests and allow removal
+    const showSessionMenuCmd = vscode.commands.registerCommand('code-with-me.showSessionMenu', async () => {
+        await showHostSessionMenu();
     });
     
     // Register status bar command for the 3 options
@@ -2167,6 +2648,7 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(startSessionDisposable);
     context.subscriptions.push(joinSessionDisposable);
     context.subscriptions.push(stopSessionDisposable);
+    context.subscriptions.push(showSessionMenuCmd);
     context.subscriptions.push(showOptionsDisposable);
     context.subscriptions.push(statusBarItem);
     context.subscriptions.push(syncStatusItem);
