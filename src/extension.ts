@@ -248,6 +248,11 @@ let lastSessionUrl: string = '';
 let hostSessionPermissions: SessionPermissions | null = null;
 let guestSessionPermissions: SessionPermissions | null = null;
 let guestUntitledMap: Map<string, vscode.TextDocument> = new Map();
+// Tracks guest-initiated requests to open/receive content for a specific file.
+// Used to ensure we only auto-open on the guest when it explicitly requested the content.
+const pendingFileContentRequests: Set<string> = new Set();
+// Optional timestamps for pending requests to avoid late/stale opens
+const pendingFileContentAt: Map<string, number> = new Map();
 let lastProcessedContent: Map<string, string> = new Map();
 let isStopping: boolean = false;
 // Session-scoped disposables (event listeners, watchers, etc.)
@@ -1014,16 +1019,33 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                 await handleCursorPosition(msg, role);
                 break;
 
-            // NEW: when Host sends file-content, Guest opens it immediately
+            // NEW: when Host sends file-content, Guest opens it only if it explicitly requested
             case 'file-content':
                 if (role === 'Guest') {
                     try {
                         const data = msg.data || msg;
-                        if (data?.path !== undefined && data?.content !== undefined) {
-                            console.log('[CodeWithMe] Guest: Opening file from file-content:', data.path);
-                            await openFileContentInGuestEditor(data.path, data.content);
+                        // Support both shapes: { data: { path, content } } and { filePath, content }
+                        const pRaw = (data?.path !== undefined) ? data.path : data?.filePath;
+                        const content = data?.content;
+                        if (pRaw && typeof content === 'string') {
+                            const p = String(pRaw);
+                            if (pendingFileContentRequests.has(p)) {
+                                // Optional freshness guard (ignore very late arrivals > 5s)
+                                const ts = pendingFileContentAt.get(p) || 0;
+                                const fresh = Date.now() - ts < 5000;
+                                pendingFileContentRequests.delete(p);
+                                pendingFileContentAt.delete(p);
+                                if (fresh) {
+                                    console.log('[CodeWithMe] Guest: Opening file from file-content (requested):', p);
+                                    await openFileContentInGuestEditor(p, content);
+                                } else {
+                                    console.log('[CodeWithMe] Guest: Ignoring stale file-content for', p);
+                                }
+                            } else {
+                                console.log('[CodeWithMe] Guest: Ignoring unsolicited file-content for', p);
+                            }
                         } else {
-                            console.warn('[CodeWithMe] Guest: file-content missing data.path/content');
+                            console.warn('[CodeWithMe] Guest: file-content missing path/filePath or content');
                         }
                     } catch (e) {
                         console.error('[CodeWithMe] Guest: Failed to open file from file-content:', e);
@@ -1090,13 +1112,7 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                         const filePath = msg.filePath || msg.data;
                         console.log('[CodeWithMe] Host: open-file received for', filePath);
                         if (filePath) {
-                            // NEW: also open the file locally on Host to mirror Guest's selection
-                            try {
-                                const uri = vscode.Uri.file(filePath);
-                                await vscode.window.showTextDocument(uri, { preview: false });
-                            } catch (e) {
-                                console.log('[CodeWithMe] Host: Could not show document in editor when mirroring guest open', e);
-                            }
+                            // Do not open the file locally on Host; only stream content back to Guest
                             // Immediately stream content back to Guest
                             await openFileForGuest(filePath);
                         }
@@ -1492,11 +1508,12 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
         let doc: vscode.TextDocument;
         if (role === 'Guest') {
             const mapped = guestUntitledMap.get(filePath);
-            if (mapped) {
+            if (mapped && !mapped.isClosed) {
                 doc = mapped;
             } else {
-                // We cannot apply partial changes without having opened the untitled doc from a prior 'file-content'
-                console.warn(`[CodeWithMe] Guest: No untitled document mapped for ${filePath}. Waiting for 'file-content' before applying deltas.`);
+                // If the document is not in our map or is closed, do nothing.
+                // The changes will be synced when the guest manually re-opens the file.
+                console.log(`[CodeWithMe] Guest: Ignoring change for untracked/closed doc ${filePath}.`);
                 return;
             }
         } else {
@@ -1512,6 +1529,28 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
         if (!msg.changes || !Array.isArray(msg.changes)) {
             console.warn('[CodeWithMe] Received file-change message without changes array. Ignoring.');
             return;
+        }
+
+        // Host-side guard: suppress a single "full clear to empty" delta that matches
+        // a typical close/revert-induced clear from a guest untitled buffer.
+        // This avoids accidental emptying of the host file when the guest closes without saving.
+        // Note: extremely rare intentional full-file deletions from a guest will be blocked by this guard.
+        if (role === 'Host' && msg.changes.length === 1) {
+            try {
+                const ch = msg.changes[0];
+                if (ch && ch.text === '' && ch.range && ch.range.start && ch.range.end) {
+                    const startZero = ch.range.start.line === 0 && ch.range.start.character === 0;
+                    const lastLine = Math.max(0, doc.lineCount - 1);
+                    const endPos = doc.lineAt(lastLine).range.end;
+                    const endMatches = ch.range.end.line === endPos.line && ch.range.end.character === endPos.character;
+                    const len = doc.getText().length;
+                    const rangeLenOk = typeof ch.rangeLength === 'number' ? (ch.rangeLength === len) : true;
+                    if (startZero && endMatches && rangeLenOk) {
+                        console.warn('[CodeWithMe] Host: Suppressing potential close-induced full clear for', filePath);
+                        return;
+                    }
+                }
+            } catch {}
         }
 
         // We'll apply edits sequentially in a stable, well-defined order to avoid
@@ -2063,6 +2102,8 @@ async function openFileInGuestEditor(filePath: string) {
     try {
         // Request file content from host and open directly in VS Code
         if (ws && ws.readyState === 1) {
+            // Mark this path as a guest-initiated request so the incoming file-content is allowed to open
+            pendingFileContentRequests.add(filePath);
             ws.send(JSON.stringify({
                 type: 'request-file-content',
                 filePath: filePath
@@ -2082,7 +2123,37 @@ async function openFileInGuestEditor(filePath: string) {
 async function openFileContentInGuestEditor(filePath: string, content: string) {
     try {
         console.log('[CodeWithMe] Guest: Opening file content in editor:', filePath);
-        // Open as a NAMED untitled document so the tab shows the real filename
+        // If this file already has a mapped untitled document, reuse it and replace content fully
+        let existing = guestUntitledMap.get(filePath);
+        // Guard against stale/closed documents left in the map after the tab was closed
+        if (existing && !vscode.workspace.textDocuments.includes(existing)) {
+            try { guestUntitledMap.delete(filePath); } catch {}
+            existing = undefined as any;
+        }
+        if (existing) {
+            const editor = await vscode.window.showTextDocument(existing, { preview: false });
+            const currentText = existing.getText();
+            if (currentText !== content) {
+                updatingFromRemoteFiles.add(filePath);
+                try {
+                    const lastLine = Math.max(0, existing.lineCount - 1);
+                    const endPos = existing.lineAt(lastLine).range.end;
+                    const ok = await editor.edit((eb) => {
+                        eb.replace(new vscode.Range(new vscode.Position(0, 0), endPos), content);
+                    }, { undoStopBefore: false, undoStopAfter: false });
+                    if (!ok) {
+                        console.warn('[CodeWithMe] Guest: Failed to replace content for already-open doc', filePath);
+                    }
+                } finally {
+                    updatingFromRemoteFiles.delete(filePath);
+                }
+                try { lastProcessedContent.set(filePath, content); } catch {}
+                try { refreshOwnershipDecorations(editor); } catch {}
+            }
+            return;
+        }
+
+        // Otherwise, open as a NAMED untitled document so the tab shows the real filename
         const title = path.basename(filePath);
         const uri = vscode.Uri.parse(`untitled:${title}`);
         const document = await vscode.workspace.openTextDocument(uri);
@@ -2091,14 +2162,16 @@ async function openFileContentInGuestEditor(filePath: string, content: string) {
 
         const editor = await vscode.window.showTextDocument(document, { preview: false });
 
-        // Insert initial content programmatically, guarded to avoid echoing as a local change
+        // Replace content programmatically, guarded to avoid echoing as a local change
         updatingFromRemoteFiles.add(filePath);
         try {
+            const lastLine = Math.max(0, document.lineCount - 1);
+            const endPos = document.lineAt(lastLine).range.end;
             const ok = await editor.edit((eb) => {
-                eb.insert(new vscode.Position(0, 0), content);
+                eb.replace(new vscode.Range(new vscode.Position(0, 0), endPos), content);
             }, { undoStopBefore: false, undoStopAfter: false });
             if (!ok) {
-                console.warn('[CodeWithMe] Guest: Failed to insert initial content for', filePath);
+                console.warn('[CodeWithMe] Guest: Failed to set initial content for', filePath);
             }
         } finally {
             updatingFromRemoteFiles.delete(filePath);
@@ -2459,23 +2532,25 @@ export function activate(context: vscode.ExtensionContext) {
     } catch (e) {
         console.error('[CodeWithMe] Failed to register Explorer view:', e);
     }
-   // Command used by Explorer file nodes
-   const openFromExplorerCmd = vscode.commands.registerCommand('code-with-me.openFromExplorer', async (node: any) => {
-       try {
-           if (!node) { console.log('[CodeWithMe] openFromExplorer: no node'); return; }
-           // Node may be WorkspaceItem.item or raw tree node
-           const n = node.item ? node.item : node;
-           if (n.type !== 'file' || !n.path) {
-               vscode.window.showWarningMessage('Code with me: Not a file');
-               return;
-           }
-           if (!ws || ws.readyState !== 1) {
-               vscode.window.showErrorMessage('Code with me: Not connected to host');
-               return;
-           }
-           // Mirror the exact quick-pick flow: host opens and immediately streams file-content
-           ws.send(JSON.stringify({ type: 'open-file', filePath: n.path }));
-           console.log('[CodeWithMe] Guest: open-file sent from Explorer for', n.path);
+    // Command used by Explorer file nodes
+    const openFromExplorerCmd = vscode.commands.registerCommand('code-with-me.openFromExplorer', async (node: any) => {
+        try {
+            if (!node) { console.log('[CodeWithMe] openFromExplorer: no node'); return; }
+            // Node may be WorkspaceItem.item or raw tree node
+            const n = node.item ? node.item : node;
+            if (n.type !== 'file' || !n.path) {
+                vscode.window.showWarningMessage('Code with me: Not a file');
+                return;
+            }
+            if (!ws || ws.readyState !== 1) {
+                vscode.window.showErrorMessage('Code with me: Not connected to host');
+                return;
+            }
+            // Mirror the exact quick-pick flow: host opens and immediately streams file-content
+            pendingFileContentRequests.add(n.path);
+            pendingFileContentAt.set(n.path, Date.now());
+            ws.send(JSON.stringify({ type: 'open-file', filePath: n.path }));
+            console.log('[CodeWithMe] Guest: open-file sent from Explorer for', n.path);
         } catch (e) {
             console.error('[CodeWithMe] openFromExplorer failed:', e);
         }
@@ -2574,6 +2649,8 @@ export function activate(context: vscode.ExtensionContext) {
         const pick = await vscode.window.showQuickPick(files, { placeHolder: 'Select a host file to open' });
         if (pick && ws && ws.readyState === 1) {
             // Change to auto-open flow: guest asks host to open and host immediately responds with file-content
+            pendingFileContentRequests.add(pick);
+            pendingFileContentAt.set(pick, Date.now());
             ws.send(JSON.stringify({ type: 'open-file', filePath: pick }));
             // Do NOT show the “Requested file …” toast
             console.log('[CodeWithMe] Guest: open-file sent for', pick);
