@@ -49,6 +49,7 @@ interface ParticipantPermissions {
 let currentSession: CollaborationSession | null = null;
 let ws: WebSocket | null = null;
 let sessionStatusItem: vscode.StatusBarItem;
+let inviteCodeStatusItem: vscode.StatusBarItem | null = null;
 let removedParticipantIds: Set<string> = new Set();
 let __cwm_wasHost: boolean = false;
 let sessionStartMs: number | null = null; // Shared timer start (host-sourced)
@@ -58,6 +59,11 @@ function ensureSessionStatusItem() {
     if (!sessionStatusItem) {
         sessionStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 1000);
         sessionStatusItem.command = 'code-with-me.showSessionMenu';
+    }
+    if (!inviteCodeStatusItem) {
+        // Slightly higher priority than syncStatusItem so it sits to the left of it
+        inviteCodeStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 101);
+        inviteCodeStatusItem.command = 'code-with-me.copyInvite';
     }
 }
 
@@ -130,8 +136,25 @@ function refreshSessionStatusBar() {
             sessionStatusItem.color = new vscode.ThemeColor(guestCount > 0 ? 'charts.green' : 'charts.red');
             // Click action when hosting
             sessionStatusItem.command = (clickAction === 'stop') ? 'code-with-me.stopSession' : 'code-with-me.showSessionMenu';
+
+            // Compute and show invite code item (host only)
+            const code = lastSessionUrl ? lastSessionUrl.substring(lastSessionUrl.lastIndexOf('/') + 1) : '';
+            if (inviteCodeStatusItem) {
+                if (code) {
+                    inviteCodeStatusItem.text = `$(key) CWM: ${code}`;
+                    const tip = new vscode.MarkdownString();
+                    tip.appendMarkdown(`Click to copy code\n\n`);
+                    if (lastSessionUrl) {
+                        tip.appendMarkdown(`URL: ${lastSessionUrl}`);
+                    }
+                    inviteCodeStatusItem.tooltip = tip;
+                    inviteCodeStatusItem.show();
+                } else {
+                    inviteCodeStatusItem.hide();
+                }
+            }
         } else if (isGuest) {
-            // Show connected state for guests, in green, with a Leave action
+            // Guest view
             const guestIcon = 'pass'; // checkmark-like icon
             sessionStatusItem.text = compact
                 ? `$(${guestIcon})`
@@ -139,6 +162,7 @@ function refreshSessionStatusBar() {
             sessionStatusItem.tooltip = 'Connected to Host — Click to leave the session';
             sessionStatusItem.color = new vscode.ThemeColor('charts.green');
             sessionStatusItem.command = 'code-with-me.stopSession'; // acts as Leave session for guests
+            if (inviteCodeStatusItem) { inviteCodeStatusItem.hide(); }
         }
     } else {
         // When stopped, show icon-only to avoid the "stopped" label as requested
@@ -155,6 +179,7 @@ function refreshSessionStatusBar() {
         sessionStatusItem.color = new vscode.ThemeColor('charts.red');
         // When stopped, clicking opens the menu
         sessionStatusItem.command = 'code-with-me.showSessionMenu';
+        if (inviteCodeStatusItem) { inviteCodeStatusItem.hide(); }
     }
     sessionStatusItem.show();
 }
@@ -1597,14 +1622,12 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             return a._idx - b._idx;
         });
 
-        // Apply each change sequentially so subsequent ranges are computed against the updated document
-        let success = true;
+        // Apply all sorted changes in a single atomic transaction
+        const combinedEdit = new vscode.WorkspaceEdit();
         for (const { range, text } of changesToApply) {
-            const single = new vscode.WorkspaceEdit();
-            single.replace(doc.uri, range, text);
-            const ok = await vscode.workspace.applyEdit(single);
-            if (!ok) { success = false; break; }
+            combinedEdit.replace(doc.uri, range, text);
         }
+        const success = await vscode.workspace.applyEdit(combinedEdit);
 
         if (success) {
             // Wait for the onDidChangeTextDocument handler to confirm it saw the event.
@@ -1932,25 +1955,21 @@ async function shareSessionLink() {
         // Extract session code from the URL
         const sessionCode = lastSessionUrl.substring(lastSessionUrl.lastIndexOf('/') + 1);
 
-        // Copy URL to clipboard
-        await vscode.env.clipboard.writeText(lastSessionUrl);
-        
-        const invitationMessage = `Session started.\n\nSession Code: ${sessionCode}\n\nShare this code or the full URL with your guest.\n\nFull URL has been copied to the clipboard.`;
+        // Copy CODE to clipboard by default (JetBrains-style)
+        await vscode.env.clipboard.writeText(sessionCode);
 
-        vscode.window.showInformationMessage('Invitation URL copied to clipboard.');
-        
+        const invitationMessage = `Session started.\n\nSession Code: ${sessionCode}\n\nShare this code or the full URL with your guest.\n\nSession code has been copied to the clipboard.`;
+
+        vscode.window.showInformationMessage('Session code copied to clipboard.');
+
         const action = await vscode.window.showInformationMessage(
             invitationMessage,
-            { title: 'Copy Code', isCloseAffordance: false },
-            { title: 'Copy URL Again', isCloseAffordance: false }
+            { title: 'Copy Code Again', isCloseAffordance: false }
         );
         
-        if (action?.title === 'Copy Code') {
+        if (action?.title === 'Copy Code Again') {
             await vscode.env.clipboard.writeText(sessionCode);
-            vscode.window.showInformationMessage('Session code copied to clipboard.');
-        } else if (action?.title === 'Copy URL Again') {
-            await vscode.env.clipboard.writeText(lastSessionUrl);
-            vscode.window.showInformationMessage('URL copied to clipboard again.');
+            vscode.window.showInformationMessage('Session code copied to clipboard again.');
         }
         
     } catch (error) {
@@ -2318,7 +2337,8 @@ async function openFileForGuest(filePath: string) {
         console.log('[CodeWithMe] Host: Guest requested file content for:', filePath);
         await sendFileContentToGuestByPath(filePath);
         
-        vscode.window.showInformationMessage(`Sent file to guest: ${path.basename(filePath)}`);
+        // Show full path so host knows exactly which file the guest opened
+        vscode.window.showInformationMessage(`Sent file to guest: ${filePath}`);
     } catch (error) {
         console.error('[CodeWithMe] Host: Error sending file to guest:', error);
         vscode.window.showErrorMessage(`[CodeWithMe] Failed to send file to guest: ${path.basename(filePath)}`);
@@ -2517,6 +2537,11 @@ export function activate(context: vscode.ExtensionContext) {
     syncStatusItem.show();
     
     console.log('[CodeWithMe] Status bar item created and shown');
+    // Ensure session status items (including invite item) are initialized
+    ensureSessionStatusItem();
+    if (inviteCodeStatusItem) {
+        context.subscriptions.push(inviteCodeStatusItem);
+    }
     
     // Ensure the Code with me Explorer view is registered (once)
     try {
@@ -2558,6 +2583,29 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(openFromExplorerCmd);
 
     // Register commands
+    const copyInviteCmd = vscode.commands.registerCommand('code-with-me.copyInvite', async () => {
+        try {
+            const url = lastSessionUrl || '';
+            const code = url ? url.substring(url.lastIndexOf('/') + 1) : '';
+            if (!code) {
+                vscode.window.showWarningMessage('No active session code to copy.');
+                return;
+            }
+            await vscode.env.clipboard.writeText(code);
+            const action = await vscode.window.showInformationMessage(
+                `Invite code copied: ${code}`,
+                { title: 'Copy Code Again', isCloseAffordance: true }
+            );
+            if (action?.title === 'Copy Code Again') {
+                await vscode.env.clipboard.writeText(code);
+                vscode.window.showInformationMessage('Session code copied to clipboard again.');
+            }
+        } catch (e) {
+            console.error('[CodeWithMe] copyInvite failed:', e);
+            vscode.window.showErrorMessage('Failed to copy invite.');
+        }
+    });
+    context.subscriptions.push(copyInviteCmd);
     let startSessionDisposable = vscode.commands.registerCommand('code-with-me.startSession', async () => {
         // Require GitHub sign-in before starting session
         const identity = await ensureGitHubSession(true);
