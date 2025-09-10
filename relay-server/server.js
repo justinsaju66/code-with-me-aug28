@@ -142,6 +142,26 @@ wss.on('connection', (ws, req) => {
       console.log(`[Relay] Received file-change for ${fp} (seq=${data.sequence ?? '?'}) from ${senderMeta.role} ${senderMeta.participantId} in session ${senderMeta.sessionId}`);
     }
 
+    // Special-case: Host kicking a specific guest should go ONLY to that guest
+    if (data && data.type === 'kick-guest' && senderMeta.role === 'Host') {
+      const targetId = data.participantId || data.guestId;
+      const session = sessions.get(senderMeta.sessionId);
+      const target = targetId && session ? session.guests.get(targetId) : null;
+      if (target && target.ws && target.ws.readyState === WebSocket.OPEN) {
+        const payload = {
+          __relay: true,
+          from: senderMeta.role,
+          participantId: senderMeta.participantId,
+          ...data
+        };
+        try { target.ws.send(JSON.stringify(payload)); } catch (e) { console.error('[Relay] kick-guest send error', e); }
+        console.log(`[Relay] Routed kick-guest to ${targetId} in session ${senderMeta.sessionId}`);
+      } else {
+        console.log(`[Relay] kick-guest target not found or not open: ${targetId}`);
+      }
+      return; // do not broadcast to all guests
+    }
+
     const envelope = {
       __relay: true,
       from: senderMeta.role || 'Unknown',

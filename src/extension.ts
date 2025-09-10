@@ -301,6 +301,25 @@ const recentMessageIds: string[] = [];
 // Map<filePath, { resolve: () => void, reject: (reason?: any) => void }>
 const editConfirmationPromises = new Map<string, { resolve: () => void, reject: (reason?: any) => void }>();
 
+// Per-file apply queue to serialize incoming edits and avoid interleaving
+const perFileApplyQueue: Map<string, Promise<void>> = new Map();
+function enqueueFileChange(filePath: string, task: () => Promise<void>): Promise<void> {
+    const previous = perFileApplyQueue.get(filePath) ?? Promise.resolve();
+    const next = previous
+        .then(() => task())
+        .catch((e) => {
+            console.error('[CodeWithMe] Error in queued file apply for', filePath, e);
+        })
+        .finally(() => {
+            // Only clear if we are still the tail
+            if (perFileApplyQueue.get(filePath) === next) {
+                perFileApplyQueue.delete(filePath);
+            }
+        });
+    perFileApplyQueue.set(filePath, next);
+    return next;
+}
+
 // Attribution: global decoration cache and per-file ownership map
 const attributionDecorationTypes: Map<string, vscode.TextEditorDecorationType> = new Map();
 // Map<filePath, Map<lineNumber, { userName: string }>>
@@ -1254,6 +1273,8 @@ function setupEditorChangeListeners() {
         return;
     }
     // Per-file debounce and seq/version tracking handled at module scope
+    // Guest-side debounce map to suppress discard/close-induced full clears
+    const pendingFullClears = new Map<string, { changes: any[]; timer: NodeJS.Timeout; doc: vscode.TextDocument }>();
 
     const onChangeDisp = vscode.workspace.onDidChangeTextDocument(async (event) => {
         console.count('[CodeWithMe] onDidChangeTextDocument fired');
@@ -1304,27 +1325,17 @@ function setupEditorChangeListeners() {
         const who = getDisplayUserName(currentRole || undefined as any);
 
         if (event.contentChanges && event.contentChanges.length > 0) {
+            // If a previous full-clear is pending for this file (we were waiting to see if the doc closes),
+            // and another edit arrives, treat it as intentional editing: merge the pending clear and continue.
+            const pendingFC = pendingFullClears.get(filePath);
+            if (pendingFC) {
+                try { clearTimeout(pendingFC.timer); } catch {}
+                pendingFullClears.delete(filePath);
+                if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                pendingChanges.get(filePath)!.push(...pendingFC.changes);
+            }
             // Guard: if guest discards an untitled buffer, VS Code may emit a single change
             // that clears the entire document before closing. Suppress broadcasting that.
-            if (currentRole === 'guest') {
-                let isGuestUntitled = false;
-                try {
-                    for (const [, doc] of guestUntitledMap.entries()) {
-                        if (doc === document) { isGuestUntitled = true; break; }
-                    }
-                } catch {}
-                if (isGuestUntitled && event.contentChanges.length === 1) {
-                    const ch = event.contentChanges[0];
-                    const prevLen = (lastProcessedContent.get(filePath) || '').length;
-                    const isFullClear = ch.rangeOffset === 0 && ch.rangeLength === prevLen && ch.text === '';
-                    if (isFullClear) {
-                        console.log('[CodeWithMe] Suppressing discard-induced clear for guest untitled doc', { filePath, prevLen });
-                        // Update tracked content to empty, but do not send
-                        lastProcessedContent.set(filePath, '');
-                        return;
-                    }
-                }
-            }
             console.log('[CodeWithMe] onDidChangeTextDocument: PROCESS local changes', {
                 file: filePath,
                 changes: event.contentChanges.length
@@ -1372,7 +1383,39 @@ function setupEditorChangeListeners() {
                 timestamp: Date.now()
             }));
             
-            pendingChanges.get(filePath)!.push(...changes);
+            // Special handling for guest single full-clear: debounce to see if the document is being closed.
+            let handledAsPendingFullClear = false;
+            if (currentRole === 'guest' && event.contentChanges.length === 1) {
+                const ch = event.contentChanges[0];
+                const prevLen = (lastProcessedContent.get(filePath) || '').length;
+                const isFullClear = ch.rangeOffset === 0 && ch.rangeLength === prevLen && ch.text === '';
+                // Only consider when editing a mapped shared doc (so we know it targets a host file)
+                let isMapped = false;
+                try {
+                    for (const [, doc] of guestUntitledMap.entries()) {
+                        if (doc === document) { isMapped = true; break; }
+                    }
+                } catch {}
+                if (isMapped && isFullClear) {
+                    // Hold this clear briefly; if the doc closes, we drop it. Otherwise, we send it.
+                    const timer = setTimeout(() => {
+                        // Timer fired: consider this an intentional clear; enqueue and send
+                        if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                        pendingChanges.get(filePath)!.push(...changes);
+                        pendingFullClears.delete(filePath);
+                        try { lastProcessedContent.set(filePath, document.getText()); } catch {}
+                        if (batchTimeout) clearTimeout(batchTimeout);
+                        batchTimeout = setTimeout(() => { sendBatchUpdates(); }, BATCH_DELAY);
+                    }, 300);
+                    pendingFullClears.set(filePath, { changes, timer, doc: document });
+                    handledAsPendingFullClear = true;
+                }
+            }
+
+            if (!handledAsPendingFullClear) {
+                if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                pendingChanges.get(filePath)!.push(...changes);
+            }
             // Update last known content after applying local change
             try { lastProcessedContent.set(filePath, document.getText()); } catch {}
             
@@ -1381,10 +1424,27 @@ function setupEditorChangeListeners() {
                 clearTimeout(batchTimeout);
             }
             
-            batchTimeout = setTimeout(() => {
-                sendBatchUpdates();
-            }, BATCH_DELAY);
+            // If we handled as pending full clear, sending is scheduled by its timer; otherwise use normal batch timer
+            if (!handledAsPendingFullClear) {
+                batchTimeout = setTimeout(() => {
+                    sendBatchUpdates();
+                }, BATCH_DELAY);
+            }
         }
+    });
+
+    // If a guest closes a document while a full-clear is pending, cancel the clear (treat as discard/close)
+    const onDidCloseDisp = vscode.workspace.onDidCloseTextDocument((closedDoc) => {
+        if (currentRole !== 'guest') return;
+        try {
+            for (const [fp, pending] of pendingFullClears.entries()) {
+                if (pending.doc === closedDoc) {
+                    try { clearTimeout(pending.timer); } catch {}
+                    pendingFullClears.delete(fp);
+                    console.log('[CodeWithMe] Guest: Cancelled pending full clear due to document close', fp);
+                }
+            }
+        } catch {}
     });
 
     // Prevent guest from saving any file during a session
@@ -1522,17 +1582,19 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             perSender.set(senderId, msg.sequence);
         }
 
-        updatingFromRemoteFiles.add(filePath);
+        await enqueueFileChange(filePath, async () => {
+        updatingFromRemoteFiles.add(filePath!);
 
         // Create a confirmation promise that the onDidChangeTextDocument handler will resolve.
         const confirmationPromise = new Promise<void>((resolve, reject) => {
             editConfirmationPromises.set(filePath!, { resolve, reject });
         });
 
+        try {
         // Resolve target document for applying remote edits
         let doc: vscode.TextDocument;
         if (role === 'Guest') {
-            const mapped = guestUntitledMap.get(filePath);
+            const mapped = guestUntitledMap.get(filePath!);
             if (mapped && !mapped.isClosed) {
                 doc = mapped;
             } else {
@@ -1543,7 +1605,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             }
         } else {
             try {
-                doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+                doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath!));
             } catch {
                 console.warn(`[CodeWithMe] Host: Could not open ${filePath} for applying changes.`);
                 return;
@@ -1559,8 +1621,9 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
         // Host-side guard: suppress a single "full clear to empty" delta that matches
         // a typical close/revert-induced clear from a guest untitled buffer.
         // This avoids accidental emptying of the host file when the guest closes without saving.
-        // Note: extremely rare intentional full-file deletions from a guest will be blocked by this guard.
-        if (role === 'Host' && msg.changes.length === 1) {
+        // IMPORTANT: If the host currently allows guest editing, honor the edit (do not suppress)
+        // so that intentional select-all + backspace by a guest will apply to the host.
+        if (role === 'Host' && msg.changes.length === 1 && !(hostSessionPermissions?.allowGuestEdit)) {
             try {
                 const ch = msg.changes[0];
                 if (ch && ch.text === '' && ch.range && ch.range.start && ch.range.end) {
@@ -1578,10 +1641,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             } catch {}
         }
 
-        // We'll apply edits sequentially in a stable, well-defined order to avoid
-        // conflicts for multiple inserts at the same position (e.g., rapid "jj").
-        // This prevents VS Code from interpreting simultaneous edits with identical
-        // ranges unpredictably inside a single WorkspaceEdit.
+        // We'll apply edits in the original sender-provided order to preserve intent.
         const changesToApply: { range: vscode.Range; text: string; rangeOffset?: number; _idx: number }[] = [];
 
         // First, validate all changes
@@ -1611,16 +1671,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             }
         }
 
-        // Sort changes: primary by explicit rangeOffset (ascending) when provided,
-        // otherwise by range start (line, character) ascending. For equal keys, use original index.
-        changesToApply.sort((a, b) => {
-            const ao = (typeof a.rangeOffset === 'number') ? a.rangeOffset : Number.POSITIVE_INFINITY;
-            const bo = (typeof b.rangeOffset === 'number') ? b.rangeOffset : Number.POSITIVE_INFINITY;
-            if (ao !== bo) return ao - bo;
-            if (a.range.start.line !== b.range.start.line) return a.range.start.line - b.range.start.line;
-            if (a.range.start.character !== b.range.start.character) return a.range.start.character - b.range.start.character;
-            return a._idx - b._idx;
-        });
+        // Do not sort; preserve the order captured by the sender
 
         // Apply all sorted changes in a single atomic transaction
         const combinedEdit = new vscode.WorkspaceEdit();
@@ -1641,7 +1692,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             } catch (e) {
                 console.warn(`[CodeWithMe] Did not receive edit confirmation for ${filePath}. The sync guard might be stale. Error:`, e);
                 // The promise might have been rejected by the timeout. Clean up the resolver.
-                const promiseControls = editConfirmationPromises.get(filePath);
+                const promiseControls = editConfirmationPromises.get(filePath!);
                 promiseControls?.reject(e);
             }
 
@@ -1676,10 +1727,10 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             }
             // Update persistent ownership map for the affected lines
             const userName = (msg.user?.userName) || getDisplayUserName(role === 'Host' ? 'host' : 'guest');
-            let map = lineOwnership.get(filePath);
+            let map = lineOwnership.get(filePath!);
             if (!map) { 
                 map = new Map(); 
-                lineOwnership.set(filePath, map); 
+                lineOwnership.set(filePath!, map); 
             }
 
             for (const change of msg.changes) {
@@ -1706,19 +1757,21 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             updateSyncStatus(`${userName} edit applied`, '$(sync)');
         } else {
             // If applyEdit failed, we must clean up the promise to prevent a memory leak.
-            const promiseControls = editConfirmationPromises.get(filePath);
+            const promiseControls = editConfirmationPromises.get(filePath!);
             promiseControls?.reject(new Error('applyEdit failed'));
             console.error(`[CodeWithMe] ${role}: Failed to apply edit for ${filePath}`);
             // Consider requesting a full resync for this file
         }
+        } finally {
+            // Always clear guards for this file
+            updatingFromRemoteFiles.delete(filePath!);
+            editConfirmationPromises.delete(filePath!);
+        }
+    }); // end enqueueFileChange task
     } catch (error) {
         console.error(`[CodeWithMe] ${role}: Error handling file change:`, error);
     } finally {
-        // This block ensures the guard and promise resolver are always cleaned up.
-        if (filePath) {
-            updatingFromRemoteFiles.delete(filePath);
-            editConfirmationPromises.delete(filePath);
-        }
+        // Note: cleanup occurs inside the queued task's finally/flow to keep the guard scoped correctly
     }
 }
 
