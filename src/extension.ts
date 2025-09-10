@@ -412,22 +412,23 @@ function getParticipantCursorDecoration(participantId: string, userName: string)
         return participantCursorDecorations.get(participantId)!;
     }
 
-    // Use a hash of the username to generate a stable, unique color
-    const hue = Math.abs(hashCode(userName)) % 360;
-    const color = `hsl(${hue}, 90%, 55%)`;
-
+    // Neutral, subtle styling (transparent-like) with smaller name label
+    // Use a very light border and a small, unobtrusive label without solid background color
+    const borderColor = 'rgba(128,128,128,0.35)';
+    const labelColor = '#888';
     const decoration = vscode.window.createTextEditorDecorationType({
-        // A thin border to represent the cursor
-        border: `1px solid ${color}`,
+        // Thin, subtle border to indicate cursor without strong color
+        border: `1px solid ${borderColor}`,
         borderRadius: '2px',
-        // A label with the user's name
         after: {
             contentText: ` ${userName}`,
             margin: '0 0 0 4px',
-            backgroundColor: color,
-            color: '#fff',
-            border: `1px solid ${color}`,
-            fontWeight: 'bold',
+            backgroundColor: 'transparent',
+            color: labelColor,
+            border: `1px solid rgba(128,128,128,0.25)`,
+            // Make the label smaller and more transparent
+            textDecoration: 'none; font-size: 12px; opacity: 0.7; padding: 0 2px; border-radius: 2px;',
+            fontWeight: 'normal',
         },
     });
 
@@ -462,12 +463,6 @@ function updateParticipantCursors() {
     }
 }
 
-// Utility: stable color per username and decoration factory
-function hashCode(s: string): number {
-    let h = 0;
-    for (let i = 0; i < s.length; i++) { h = ((h << 5) - h) + s.charCodeAt(i); h |= 0; }
-    return h;
-}
 function getUserDecoration(userName: string): vscode.TextEditorDecorationType {
     if (attributionDecorationTypes.has(userName)) return attributionDecorationTypes.get(userName)!;
     // Unified blue color for all ownership highlights
@@ -758,10 +753,10 @@ function getLanguageFromPath(filePath: string): string {
 
 // Legacy screen update loop, WebRTC, and input simulation code removed.
 
-// JetBrains-style collaborative editing - no screen capture, real-time file sync
-async function setupJetBrainsStyleCollaboration(url: string, role: 'Host' | 'Guest') {
+// Collaborative editing - no screen capture, real-time file sync
+async function setupCollaborationSession(url: string, role: 'Host' | 'Guest') {
     try {
-        console.log(`[CodeWithMe] ${role}: Setting up JetBrains-style collaboration with URL:`, url);
+        console.log(`[CodeWithMe] ${role}: Setting up collaboration with URL:`, url);
         
         // Connect to WebSocket server
         ws = new WebSocket(url);
@@ -1216,7 +1211,9 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
             case MESSAGE_TYPES.GUEST_LEFT:
                 if (currentSession && currentSession.role === 'host') {
                     const leftUser = msg.userName || 'A guest';
-                    vscode.window.showInformationMessage(`${leftUser} has left the session`);
+                    // Suppress toast here to avoid duplicate notifications.
+                    // handleParticipantLeft will show a single user-friendly message instead.
+                    console.log(`[CodeWithMe] Guest left (suppressed toast): ${leftUser}`);
                 }
                 break;
 
@@ -1915,7 +1912,19 @@ async function handleParticipantJoined(msg: any) {
 }
 
 async function handleParticipantLeft(msg: any) {
-    console.log('[CodeWithMe] Participant left:', msg.participantId);
+    const participantId: string | undefined = msg?.participantId;
+    let displayName: string = 'Guest';
+    // Prefer an explicit name on the message, then fall back to the participants map
+    if (msg?.userName && typeof msg.userName === 'string' && msg.userName.trim().length > 0) {
+        displayName = msg.userName;
+    }
+    if (participantId && currentSession?.participants) {
+        const participant = currentSession.participants.get(participantId);
+        if (participant?.name && participant.name.trim().length > 0) {
+            displayName = participant.name;
+        }
+    }
+    console.log('[CodeWithMe] Participant left:', participantId);
     // Remove from participants map
     try {
         if (currentSession && currentSession.participants && msg.participantId) {
@@ -1923,7 +1932,7 @@ async function handleParticipantLeft(msg: any) {
         }
     } catch {}
     refreshSessionStatusBar();
-    vscode.window.showInformationMessage(`${msg.participantId} left the session`);
+    vscode.window.showInformationMessage(`${displayName} left the session`);
     participantCursors.delete(msg.participantId);
     // NEW: Clean up decorations for the participant who left
     if (participantCursorDecorations.has(msg.participantId)) {
@@ -1957,7 +1966,7 @@ async function setupCollaboration(url: string, role: 'Host' | 'Guest') {
         console.log(`[CodeWithMe] ${role}: Setting up collaboration with URL:`, url);
         
         // Use JetBrains-style collaboration (no screen capture)
-        await setupJetBrainsStyleCollaboration(url, role);
+        await setupCollaborationSession(url, role);
         
     } catch (error) {
         console.error(`[CodeWithMe] ${role}: Error setting up collaboration:`, error);
@@ -1995,7 +2004,7 @@ async function joinSession() {
    vscode.window.showInformationMessage('Connecting to host server...');
    
    // Use JetBrains-style collaboration (direct file sharing)
-   await setupJetBrainsStyleCollaboration(sessionUrl, 'Guest');
+   await setupCollaborationSession(sessionUrl, 'Guest');
 }
 
 async function shareSessionLink() {
@@ -2692,7 +2701,7 @@ export function activate(context: vscode.ExtensionContext) {
         const sessionId = generateSessionCode();
         lastSessionUrl = `${DEFAULT_PUBLIC_WS_URL}/${sessionId}`;
 
-        await setupJetBrainsStyleCollaboration(lastSessionUrl, 'Host');
+        await setupCollaborationSession(lastSessionUrl, 'Host');
         // Set shared session start time
         sessionStartMs = Date.now();
         __cwm_wasHost = true;
