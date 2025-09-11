@@ -95,7 +95,7 @@ function refreshSessionStatusBar() {
     const iconActive = customCodicon || 'broadcast';
     const iconStopped = 'circle-slash';
     const formatElapsed = (start: number | null) => {
-        if (!start) return '';
+        if (!start) {return '';}
         const total = Math.max(0, Math.floor((Date.now() - start) / 1000));
         const h = Math.floor(total / 3600);
         const m = Math.floor((total % 3600) / 60);
@@ -290,7 +290,7 @@ let fileWatchersActive = false;
 let lastProcessedSequence = 0;
 let pendingChanges: Map<string, any[]> = new Map();
 let batchTimeout: NodeJS.Timeout | null = null;
-const BATCH_DELAY = 100; // ms
+const BATCH_DELAY = 50; // ms
 // Per-file outgoing sequence counters
 const fileSeqCounter: Map<string, number> = new Map();
 // Per-file, per-sender last processed sequence to de-duplicate on receive
@@ -300,6 +300,15 @@ const recentMessageIds: string[] = [];
 // A robust guard to link remote edits to the events they produce.
 // Map<filePath, { resolve: () => void, reject: (reason?: any) => void }>
 const editConfirmationPromises = new Map<string, { resolve: () => void, reject: (reason?: any) => void }>();
+
+// Presence smoothing for many participants: debounce remote cursor decorations
+const cursorDecorateTimers: Map<string, NodeJS.Timeout> = new Map();
+const CURSOR_DECORATE_MS = 40;
+
+// Local cursor send debounce and dedupe
+const cursorSendTimers: Map<string, NodeJS.Timeout> = new Map(); // key: filePath
+const lastSentCursorPos: Map<string, { line: number; character: number }> = new Map();
+const CURSOR_SEND_MS = 45;
 
 // Per-file apply queue to serialize incoming edits and avoid interleaving
 const perFileApplyQueue: Map<string, Promise<void>> = new Map();
@@ -367,12 +376,12 @@ let cwmCurrentIdentity: GitHubIdentity | null = null;
 // Resolve a stable display name for attribution
 function getDisplayUserName(roleHint?: 'host' | 'guest'): string {
     try {
-        if (cwmCurrentIdentity?.userName) return cwmCurrentIdentity.userName;
+        if (cwmCurrentIdentity?.userName) {return cwmCurrentIdentity.userName;}
         // Try VS Code authenticated accounts (silent)
         // Note: we won't block if it fails
         const anyGlobal = (global as any);
         const cached = anyGlobal.__cwm_fallbackUserName;
-        if (cached) return cached;
+        if (cached) {return cached;}
         const os = require('os');
         const envUser = process.env['GIT_AUTHOR_NAME'] || process.env['USER'] || process.env['USERNAME'] || os.userInfo()?.username;
         const name = envUser || (roleHint === 'host' ? 'Host' : roleHint === 'guest' ? 'Guest' : 'Unknown');
@@ -439,7 +448,7 @@ function getParticipantCursorDecoration(participantId: string, userName: string)
 // NEW: Function to render all participant cursors in the active editor
 function updateParticipantCursors() {
     const editor = vscode.window.activeTextEditor;
-    if (!editor) return;
+    if (!editor) {return;}
 
     // Clear all previous cursor decorations
     participantCursorDecorations.forEach(deco => editor.setDecorations(deco, []));
@@ -464,7 +473,7 @@ function updateParticipantCursors() {
 }
 
 function getUserDecoration(userName: string): vscode.TextEditorDecorationType {
-    if (attributionDecorationTypes.has(userName)) return attributionDecorationTypes.get(userName)!;
+    if (attributionDecorationTypes.has(userName)) {return attributionDecorationTypes.get(userName)!;}
     // Unified blue color for all ownership highlights
     const color = '#2F81F7'; // blue
     const deco = vscode.window.createTextEditorDecorationType({
@@ -482,7 +491,7 @@ function getUserDecoration(userName: string): vscode.TextEditorDecorationType {
 // Per-user compact header decoration (used once per contiguous block)
 function getHeaderDecoration(userName: string): vscode.TextEditorDecorationType {
     // Cache per user so labels are stable
-    if (headerDecorationTypes.has(userName)) return headerDecorationTypes.get(userName)!;
+    if (headerDecorationTypes.has(userName)) {return headerDecorationTypes.get(userName)!;}
 
     // Show pill at end of the line (right side), subtle and compact
     const header = vscode.window.createTextEditorDecorationType({
@@ -529,12 +538,12 @@ function refreshOwnershipDecorations(editor: vscode.TextEditor) {
         attributionDecorationTypes.forEach((deco) => editor.setDecorations(deco, []));
         headerDecorationTypes.forEach((deco) => editor.setDecorations(deco, []));
 
-        if (!map) return;
+        if (!map) {return;}
 
         // 1) Collect owned lines per user
         const perUserLines = new Map<string, number[]>();
         for (const [line, meta] of map.entries()) {
-            if (line >= editor.document.lineCount) continue;
+            if (line >= editor.document.lineCount) {continue;}
             const arr = perUserLines.get(meta.userName) ?? [];
             arr.push(line);
             perUserLines.set(meta.userName, arr);
@@ -884,7 +893,7 @@ async function setupCollaborationSession(url: string, role: 'Host' | 'Guest') {
         ws.onmessage = async (event: any) => {
             try {
                 const normalizeParticipantId = (s?: string) => {
-                    if (!s) return s;
+                    if (!s) {return s;}
                     return s.replace(/^(guest-|host-)/, '');
                 };
                 // Normalize to string
@@ -894,7 +903,7 @@ async function setupCollaborationSession(url: string, role: 'Host' | 'Guest') {
                 } else {
                     text = event.data?.toString?.() ?? '';
                 }
-                if (!text) return;
+                if (!text) {return;}
 
                 let msg: any;
                 try {
@@ -1118,10 +1127,10 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                     // Auto-request first file (best effort) is optional; do not block the explorer population
                     const findFirstFile = (nodes: any[]): string | undefined => {
                         for (const n of nodes) {
-                            if (n.type === 'file' && n.path) return n.path;
+                            if (n.type === 'file' && n.path) {return n.path;}
                             if (n.type === 'folder' && Array.isArray(n.children)) {
                                 const f = findFirstFile(n.children);
-                                if (f) return f;
+                                if (f) {return f;}
                             }
                         }
                         return undefined;
@@ -1233,7 +1242,7 @@ function setupFileWatchers() {
         return;
     }
     const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (!workspaceFolders) return;
+    if (!workspaceFolders) {return;}
 
     // Watch for file creates only to stream initial content; avoid echoing editor changes
     const fileWatcher = vscode.workspace.createFileSystemWatcher('**/*');
@@ -1328,7 +1337,7 @@ function setupEditorChangeListeners() {
             if (pendingFC) {
                 try { clearTimeout(pendingFC.timer); } catch {}
                 pendingFullClears.delete(filePath);
-                if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                if (!pendingChanges.has(filePath)) {pendingChanges.set(filePath, []);}
                 pendingChanges.get(filePath)!.push(...pendingFC.changes);
             }
             // Guard: if guest discards an untitled buffer, VS Code may emit a single change
@@ -1397,11 +1406,11 @@ function setupEditorChangeListeners() {
                     // Hold this clear briefly; if the doc closes, we drop it. Otherwise, we send it.
                     const timer = setTimeout(() => {
                         // Timer fired: consider this an intentional clear; enqueue and send
-                        if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                        if (!pendingChanges.has(filePath)) {pendingChanges.set(filePath, []);}
                         pendingChanges.get(filePath)!.push(...changes);
                         pendingFullClears.delete(filePath);
                         try { lastProcessedContent.set(filePath, document.getText()); } catch {}
-                        if (batchTimeout) clearTimeout(batchTimeout);
+                        if (batchTimeout) {clearTimeout(batchTimeout);}
                         batchTimeout = setTimeout(() => { sendBatchUpdates(); }, BATCH_DELAY);
                     }, 300);
                     pendingFullClears.set(filePath, { changes, timer, doc: document });
@@ -1410,7 +1419,7 @@ function setupEditorChangeListeners() {
             }
 
             if (!handledAsPendingFullClear) {
-                if (!pendingChanges.has(filePath)) pendingChanges.set(filePath, []);
+                if (!pendingChanges.has(filePath)) {pendingChanges.set(filePath, []);}
                 pendingChanges.get(filePath)!.push(...changes);
             }
             // Update last known content after applying local change
@@ -1432,7 +1441,7 @@ function setupEditorChangeListeners() {
 
     // If a guest closes a document while a full-clear is pending, cancel the clear (treat as discard/close)
     const onDidCloseDisp = vscode.workspace.onDidCloseTextDocument((closedDoc) => {
-        if (currentRole !== 'guest') return;
+        if (currentRole !== 'guest') {return;}
         try {
             for (const [fp, pending] of pendingFullClears.entries()) {
                 if (pending.doc === closedDoc) {
@@ -1441,6 +1450,11 @@ function setupEditorChangeListeners() {
                     console.log('[CodeWithMe] Guest: Cancelled pending full clear due to document close', fp);
                 }
             }
+            // Also clear cursor debounce state for this file if applicable
+            const fp = closedDoc.uri.fsPath;
+            try { const t = cursorSendTimers.get(fp); if (t) { clearTimeout(t); } } catch {}
+            cursorSendTimers.delete(fp);
+            lastSentCursorPos.delete(fp);
         } catch {}
     });
 
@@ -1463,30 +1477,57 @@ function setupEditorChangeListeners() {
     // Track cursor position changes
     const onSelDisp = vscode.window.onDidChangeTextEditorSelection(async (event) => {
         console.count('[CodeWithMe] onDidChangeTextEditorSelection fired');
-        if (ws && ws.readyState === 1) {
-            // Map guest untitled doc back to host path
-            let selFilePath = event.textEditor.document.uri.fsPath;
-            if (currentRole === 'guest') {
-                try {
-                    for (const [hostPath, doc] of guestUntitledMap.entries()) {
-                        if (doc === event.textEditor.document) { selFilePath = hostPath; break; }
-                    }
-                } catch {}
-            }
-            ws.send(JSON.stringify({
-                type: 'cursor-position',
-                filePath: selFilePath,
-                position: { line: event.selections[0].active.line, character: event.selections[0].active.character },
-                timestamp: Date.now(),
-                user: cwmCurrentIdentity ? { 
-                    userId: cwmCurrentIdentity.userId, 
-                    userName: cwmCurrentIdentity.userName 
-                } : { 
-                    userId: currentUserId, 
-                    userName: 'Unknown' 
+        if (!(ws && ws.readyState === 1)) { return; }
+
+        // Map guest untitled doc back to host path
+        let selFilePath = event.textEditor.document.uri.fsPath;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === event.textEditor.document) { selFilePath = hostPath; break; }
                 }
-            }));
+            } catch {}
         }
+
+        // Suppress local cursor broadcasts when this file is being updated from remote
+        if (updatingFromRemoteFiles.has(selFilePath)) {
+            return;
+        }
+
+        const activeSel = event.selections[0]?.active;
+        if (!activeSel) { return; }
+
+        // Only send if changed since last send for this file
+        const last = lastSentCursorPos.get(selFilePath);
+        if (last && last.line === activeSel.line && last.character === activeSel.character) {
+            return;
+        }
+
+        // Debounce per file path
+        const existing = cursorSendTimers.get(selFilePath);
+        if (existing) { try { clearTimeout(existing); } catch {} }
+        const timer = setTimeout(() => {
+            try {
+                lastSentCursorPos.set(selFilePath, { line: activeSel.line, character: activeSel.character });
+                ws!.send(JSON.stringify({
+                    type: 'cursor-position',
+                    filePath: selFilePath,
+                    position: { line: activeSel.line, character: activeSel.character },
+                    timestamp: Date.now(),
+                    participantId: currentUserId,
+                    user: cwmCurrentIdentity ? {
+                        userId: cwmCurrentIdentity.userId,
+                        userName: cwmCurrentIdentity.userName
+                    } : {
+                        userId: currentUserId,
+                        userName: 'Unknown'
+                    }
+                }));
+            } catch (e) {
+                console.warn('[CodeWithMe] Failed to send debounced cursor-position', e);
+            }
+        }, CURSOR_SEND_MS);
+        cursorSendTimers.set(selFilePath, timer);
     });
     sessionDisposables.push(onSelDisp);
     sessionListenersActive = true;
@@ -1494,10 +1535,10 @@ function setupEditorChangeListeners() {
 
 // Function to send batched updates
 function sendBatchUpdates() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {return;}
     
     pendingChanges.forEach((changes, filePath) => {
-        if (changes.length === 0) return;
+        if (changes.length === 0) {return;}
         
         // Preserve original capture order; do not resort by timestamp
         
@@ -1544,7 +1585,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
     try {
         console.count('[CodeWithMe] handleFileChange fired');
         filePath = msg.filePath || msg.path;
-        if (!filePath) return;
+        if (!filePath) {return;}
 
         // Drop our own echoes
         if (msg.originId && msg.originId === currentUserId) {
@@ -1670,12 +1711,25 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
 
         // Do not sort; preserve the order captured by the sender
 
+        // Preserve and restore local selection so caret does not shift when others edit above
+        const editor = vscode.window.visibleTextEditors.find(e => e.document === doc);
+        const selectionBefore = editor?.selection;
+
         // Apply all sorted changes in a single atomic transaction
         const combinedEdit = new vscode.WorkspaceEdit();
         for (const { range, text } of changesToApply) {
             combinedEdit.replace(doc.uri, range, text);
         }
         const success = await vscode.workspace.applyEdit(combinedEdit);
+
+        // Restore selection to keep local caret independent of remote inserts above
+        if (editor && selectionBefore) {
+            try {
+                editor.selection = selectionBefore;
+            } catch (e) {
+                console.warn('[CodeWithMe] Could not restore selection after remote edit.', e);
+            }
+        }
 
         if (success) {
             // Wait for the onDidChangeTextDocument handler to confirm it saw the event.
@@ -1772,21 +1826,47 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
     }
 }
 
-// Handle cursor position updates
+// Handle cursor position updates (remote presence as decorations only)
 async function handleCursorPosition(msg: any, role: 'Host' | 'Guest') {
-    const participantId = msg.participantId;
-    if (!participantId) return;
+    const participantId = msg.participantId || msg.user?.userId;
+    if (!participantId) { return; }
+    // Never render our own remote cursor
+    if (participantId === currentUserId) { return; }
+    if (!msg || !msg.filePath || !msg.position) { return; }
 
-    // Store cursor position for display (could show decorations)
+    // Store latest presence
     participantCursors.set(participantId, {
         filePath: msg.filePath,
         position: msg.position,
         timestamp: msg.timestamp,
-        user: msg.user // Keep user info for name display
+        user: msg.user
     });
 
-    // NEW: Update visual decorations for all cursors
-    updateParticipantCursors();
+    const scheduleDecorate = () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) { return; }
+        const decorationType = getParticipantCursorDecoration(participantId, msg.user?.userName || 'Guest');
+        let currentEditorHostPath = editor.document.uri.fsPath;
+        if (currentRole === 'guest') {
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === editor.document) { currentEditorHostPath = hostPath; break; }
+                }
+            } catch {}
+        }
+        if (msg.filePath === currentEditorHostPath) {
+            const range = new vscode.Range(msg.position, msg.position);
+            editor.setDecorations(decorationType, [range]);
+        } else {
+            editor.setDecorations(decorationType, []);
+        }
+    };
+
+    // Debounce per participant to reduce flicker with many updates
+    const existing = cursorDecorateTimers.get(participantId);
+    if (existing) { try { clearTimeout(existing); } catch {} }
+    const t = setTimeout(scheduleDecorate, CURSOR_DECORATE_MS);
+    cursorDecorateTimers.set(participantId, t);
 }
 
 // Handle workspace info for guests
@@ -1804,8 +1884,8 @@ async function handleWorkspaceInfo(msg: any) {
         let fileCount = 0;
         const countFiles = (nodes: any[]) => {
             for (const node of nodes) {
-                if (node.type === 'file') fileCount++;
-                else if (node.type === 'folder' && Array.isArray(node.children)) countFiles(node.children);
+                if (node.type === 'file') {fileCount++;}
+                else if (node.type === 'folder' && Array.isArray(node.children)) {countFiles(node.children);}
             }
         };
         countFiles(info.tree);
@@ -2082,8 +2162,8 @@ async function getWorkspaceFiles(rootPath: string): Promise<any[]> {
     
     // Sort entries: folders first, then files, both alphabetically
     const sortedEntries = entries.sort((a, b) => {
-        if (a.isDirectory() && !b.isDirectory()) return -1;
-        if (!a.isDirectory() && b.isDirectory()) return 1;
+        if (a.isDirectory() && !b.isDirectory()) {return -1;}
+        if (!a.isDirectory() && b.isDirectory()) {return 1;}
         return a.name.localeCompare(b.name);
     });
     
@@ -2095,7 +2175,7 @@ async function getWorkspaceFiles(rootPath: string): Promise<any[]> {
             entry.name === '.git' ||
             entry.name === 'dist' ||
             entry.name === 'build' ||
-            entry.name === '.vscode') continue;
+            entry.name === '.vscode') {continue;}
             
         const fullPath = path.join(rootPath, entry.name);
         
@@ -2313,9 +2393,9 @@ async function insertTextAtCursor(text: string) {
 function isUsernameMarker(line: string, who?: string): boolean {
     try {
         const t = (line || '').trim();
-        if (!t) return false;
-        if (!t.includes('[cwm-user]')) return false;
-        if (who && !t.includes(who)) return false;
+        if (!t) {return false;}
+        if (!t.includes('[cwm-user]')) {return false;}
+        if (who && !t.includes(who)) {return false;}
         // Recognized single-line comment prefixes and HTML-style marker
         return t.startsWith('#') || t.startsWith('//') || t.startsWith(';') || t.startsWith('<!--');
     } catch {
@@ -2327,10 +2407,10 @@ function isUsernameMarker(line: string, who?: string): boolean {
 
 // Naive diff to detect changed span for attribution
 function computeChangedRange(oldText: string, newText: string, doc: vscode.TextDocument): vscode.Range | null {
-    if (oldText === newText) return null;
+    if (oldText === newText) {return null;}
     let start = 0;
     const minLen = Math.min(oldText.length, newText.length);
-    while (start < minLen && oldText[start] === newText[start]) start++;
+    while (start < minLen && oldText[start] === newText[start]) {start++;}
     let endOld = oldText.length - 1;
     let endNew = newText.length - 1;
     while (endOld >= start && endNew >= start && oldText[endOld] === newText[endNew]) { endOld--; endNew--; }
@@ -2556,7 +2636,7 @@ function findFileInTree(tree: any[], fileName: string): string | null {
             return node.path;
         } else if (node.type === 'folder' && node.children) {
             const result = findFileInTree(node.children, fileName);
-            if (result) return result;
+            if (result) {return result;}
         }
     }
     return null;
@@ -2747,8 +2827,8 @@ export function activate(context: vscode.ExtensionContext) {
         const files: string[] = [];
         const walk = (nodes: any[]) => {
             for (const n of nodes) {
-                if (n.type === 'file' && n.path) files.push(n.path);
-                if (n.type === 'folder' && Array.isArray(n.children)) walk(n.children);
+                if (n.type === 'file' && n.path) {files.push(n.path);}
+                if (n.type === 'folder' && Array.isArray(n.children)) {walk(n.children);}
             }
         };
         walk(info.tree);
@@ -2820,7 +2900,7 @@ export function activate(context: vscode.ExtensionContext) {
             { placeHolder: 'Choose Code with me action...' }
         );
         
-        if (!action) return;
+        if (!action) {return;}
 
         if (action.label === 'Start Session') {
             await vscode.commands.executeCommand('code-with-me.startSession');
@@ -2851,11 +2931,11 @@ export function activate(context: vscode.ExtensionContext) {
 
     // Persist labels across navigation during the session (Host and Guest)
     vscode.window.onDidChangeActiveTextEditor((ed) => {
-        if (ed) refreshOwnershipDecorations(ed);
+        if (ed) {refreshOwnershipDecorations(ed);}
     });
     vscode.workspace.onDidOpenTextDocument((doc) => {
         const ed = vscode.window.visibleTextEditors.find(e => e.document === doc);
-        if (ed) refreshOwnershipDecorations(ed);
+        if (ed) {refreshOwnershipDecorations(ed);}
     });
 }
 
@@ -3031,8 +3111,8 @@ async function discardAndCloseAllEditors() {
 
 // Fixed stopSession function
 async function stopSession(notifyOthers: boolean = true, initiatedBy: 'host' | 'guest' | 'auto' = 'auto') {
-    if (!currentSession && !ws) return;
-    if (isStopping) return;
+    if (!currentSession && !ws) {return;}
+    if (isStopping) {return;}
     
     isStopping = true;
     const wasHost = currentSession?.role === 'host';
