@@ -1081,7 +1081,36 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                     const openerName: string = msg.userName || 'Participant';
                     const p: string | undefined = msg.filePath || msg.path;
                     if (p && openerId !== currentUserId) {
-                        vscode.window.showInformationMessage(`${openerName} opened ${p}`);
+                        // Format: <project>/<full relative path from project root>
+                        // Robust even if guest's local workspace does not include host path
+                        let displayPath = '';
+                        try {
+                            const uri = vscode.Uri.file(p);
+                            const wsFolder = vscode.workspace.getWorkspaceFolder(uri);
+                            const relRaw = vscode.workspace.asRelativePath(uri, false);
+                            const rel = relRaw.split(path.sep).join('/');
+                            if (wsFolder && wsFolder.name) {
+                                displayPath = `${wsFolder.name}/${rel}`;
+                            } else {
+                                // Fallback: derive project as the directory just above the file
+                                const parts = p.split(path.sep).filter(Boolean);
+                                const fileName = parts.length ? parts[parts.length - 1] : p;
+                                const project = parts.length >= 2 ? parts[parts.length - 2] : '';
+                                // If there are deeper folders beyond project, include them
+                                // Find index of project in parts and include tail after it
+                                let tail = fileName;
+                                if (project) {
+                                    const projIdx = parts.lastIndexOf(project);
+                                    const after = parts.slice(projIdx + 1);
+                                    tail = after.join('/');
+                                }
+                                displayPath = project ? `${project}/${tail}` : fileName;
+                            }
+                        } catch {
+                            // Ultimate fallback to basename
+                            displayPath = path.basename(p);
+                        }
+                        vscode.window.showInformationMessage(`${openerName} opened ${displayPath}`);
                     }
                 } catch (e) {
                     console.warn('[CodeWithMe] Failed to process file-opened message', e);
@@ -1426,23 +1455,19 @@ function setupEditorChangeListeners() {
             if (currentRole === 'guest' && event.contentChanges.length === 1) {
                 const ch = event.contentChanges[0];
                 const prevLen = (lastProcessedContent.get(filePath) || '').length;
-                const isFullClear = ch.rangeOffset === 0 && ch.rangeLength === prevLen && ch.text === '';
-                // Only consider when editing a mapped shared doc (so we know it targets a host file)
-                let isMapped = false;
-                try {
-                    for (const [, doc] of guestUntitledMap.entries()) {
-                        if (doc === document) { isMapped = true; break; }
-                    }
-                } catch {}
-                if (isMapped && isFullClear) {
+                // Consider either our last known length or the current document length for robustness
+                const docLen = document.getText().length;
+                const baseLen = Math.max(prevLen, docLen);
+                const isFullClear = ch.rangeOffset === 0 && ch.rangeLength === baseLen && ch.text === '';
+                if (isFullClear) {
                     // Hold this clear briefly; if the doc closes, we drop it. Otherwise, we send it.
                     const timer = setTimeout(() => {
                         // Timer fired: consider this an intentional clear; enqueue and send
-                        if (!pendingChanges.has(filePath)) {pendingChanges.set(filePath, []);}
+                        if (!pendingChanges.has(filePath)) {pendingChanges.set(filePath, []);}                        
                         pendingChanges.get(filePath)!.push(...changes);
                         pendingFullClears.delete(filePath);
                         try { lastProcessedContent.set(filePath, document.getText()); } catch {}
-                        if (batchTimeout) {clearTimeout(batchTimeout);}
+                        if (batchTimeout) {clearTimeout(batchTimeout);}                        
                         batchTimeout = setTimeout(() => { sendBatchUpdates(); }, BATCH_DELAY);
                     }, 300);
                     pendingFullClears.set(filePath, { changes, timer, doc: document });
@@ -1475,6 +1500,7 @@ function setupEditorChangeListeners() {
     const onDidCloseDisp = vscode.workspace.onDidCloseTextDocument((closedDoc) => {
         if (currentRole !== 'guest') {return;}
         try {
+            // Cancel any pending full-clear for this doc
             for (const [fp, pending] of pendingFullClears.entries()) {
                 if (pending.doc === closedDoc) {
                     try { clearTimeout(pending.timer); } catch {}
@@ -1482,11 +1508,21 @@ function setupEditorChangeListeners() {
                     console.log('[CodeWithMe] Guest: Cancelled pending full clear due to document close', fp);
                 }
             }
+            // Resolve the host path for this closed doc and drop any enqueued pendingChanges to avoid sending empties
+            let hostPathForClosed = closedDoc.uri.fsPath;
+            try {
+                for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                    if (doc === closedDoc) { hostPathForClosed = hostPath; break; }
+                }
+            } catch {}
+            if (pendingChanges.has(hostPathForClosed)) {
+                pendingChanges.delete(hostPathForClosed);
+                console.log('[CodeWithMe] Guest: Dropped pending changes for closed document', hostPathForClosed);
+            }
             // Also clear cursor debounce state for this file if applicable
-            const fp = closedDoc.uri.fsPath;
-            try { const t = cursorSendTimers.get(fp); if (t) { clearTimeout(t); } } catch {}
-            cursorSendTimers.delete(fp);
-            lastSentCursorPos.delete(fp);
+            try { const t = cursorSendTimers.get(hostPathForClosed); if (t) { clearTimeout(t); } } catch {}
+            cursorSendTimers.delete(hostPathForClosed);
+            lastSentCursorPos.delete(hostPathForClosed);
         } catch {}
     });
 
@@ -2599,8 +2635,6 @@ async function openFileForGuest(filePath: string) {
     }
 }
 
-// Remove all WebRTC and screen sharing logic
-// Only keep file-based workspace and file sharing logic
 // Function to update file content from guest
 async function updateFileFromGuest(filePath: string, content: string) {
     try {
@@ -2770,8 +2804,6 @@ function showSyncActivity(activity: string) {
         updateSyncStatus('Ready');
     }, 2000);
 }
-
-// WebView removed - direct VS Code integration
 
 // Main activation function
 export function activate(context: vscode.ExtensionContext) {
