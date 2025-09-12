@@ -1832,7 +1832,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
             try {
                 const caretStart = selectionBefore.start;
                 let anyAtOrBeforeCaret = false;
-                let newlineBeforeOrAtCaret = false;
+                let newlineOnCaretLineBeforeOrAtCaret = false;
                 for (const { range } of changesToApply) {
                     if (range.start.isBeforeOrEqual(caretStart)) { anyAtOrBeforeCaret = true; break; }
                 }
@@ -1840,7 +1840,7 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
                     // All edits after caret: safe to restore exactly
                     editor.selection = selectionBefore;
                 } else {
-                    // Some edit at/before caret: do not pin caret, except handle remote Enter before caret specially
+                    // Some edit at/before caret: do not pin caret, except handle remote Enter on the SAME line specially
                     // Detect newline insertion relative to caret
                     for (const change of msg.changes || []) {
                         try {
@@ -1849,14 +1849,15 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
                             // Compare using offsets if provided; else compare using range start
                             if (typeof change.rangeOffset === 'number') {
                                 const caretOffset = doc.offsetAt(caretStart);
-                                if (change.rangeOffset <= caretOffset) { newlineBeforeOrAtCaret = true; break; }
+                                const chPos = doc.positionAt(change.rangeOffset);
+                                if (chPos.line === caretStart.line && change.rangeOffset <= caretOffset) { newlineOnCaretLineBeforeOrAtCaret = true; break; }
                             } else if (change.range && change.range.start) {
                                 const chStart = new vscode.Position(change.range.start.line, change.range.start.character);
-                                if (chStart.isBeforeOrEqual(caretStart)) { newlineBeforeOrAtCaret = true; break; }
+                                if (chStart.line === caretStart.line && chStart.isBeforeOrEqual(caretStart)) { newlineOnCaretLineBeforeOrAtCaret = true; break; }
                             }
                         } catch {}
                     }
-                    if (newlineBeforeOrAtCaret) {
+                    if (newlineOnCaretLineBeforeOrAtCaret) {
                         // Keep caret at end of the (previous) line so it doesn't drop to next line
                         const targetLine = Math.max(0, Math.min(caretStart.line, editor.document.lineCount - 1));
                         const endPos = editor.document.lineAt(targetLine).range.end;
