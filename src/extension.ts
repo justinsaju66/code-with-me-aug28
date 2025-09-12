@@ -1787,12 +1787,49 @@ async function handleFileChange(msg: any, role: 'Host' | 'Guest') {
         }
         const success = await vscode.workspace.applyEdit(combinedEdit);
 
-        // Restore selection to keep local caret independent of remote inserts above
+        // Smart selection restore:
+        // - If ALL incoming changes start strictly after the caret start, restore selection (no caret shift).
+        // - If ANY incoming change starts at or before the caret start, do NOT restore, so caret follows text naturally,
+        //   EXCEPT: if a newline was inserted at or before the caret start on this line, keep the caret on the previous line's end
+        //   so it does not drop to the next line on remote Enter.
         if (editor && selectionBefore) {
             try {
-                editor.selection = selectionBefore;
+                const caretStart = selectionBefore.start;
+                let anyAtOrBeforeCaret = false;
+                let newlineBeforeOrAtCaret = false;
+                for (const { range } of changesToApply) {
+                    if (range.start.isBeforeOrEqual(caretStart)) { anyAtOrBeforeCaret = true; break; }
+                }
+                if (!anyAtOrBeforeCaret) {
+                    // All edits after caret: safe to restore exactly
+                    editor.selection = selectionBefore;
+                } else {
+                    // Some edit at/before caret: do not pin caret, except handle remote Enter before caret specially
+                    // Detect newline insertion relative to caret
+                    for (const change of msg.changes || []) {
+                        try {
+                            const hasNewline = typeof change.text === 'string' && change.text.indexOf('\n') !== -1;
+                            if (!hasNewline) { continue; }
+                            // Compare using offsets if provided; else compare using range start
+                            if (typeof change.rangeOffset === 'number') {
+                                const caretOffset = doc.offsetAt(caretStart);
+                                if (change.rangeOffset <= caretOffset) { newlineBeforeOrAtCaret = true; break; }
+                            } else if (change.range && change.range.start) {
+                                const chStart = new vscode.Position(change.range.start.line, change.range.start.character);
+                                if (chStart.isBeforeOrEqual(caretStart)) { newlineBeforeOrAtCaret = true; break; }
+                            }
+                        } catch {}
+                    }
+                    if (newlineBeforeOrAtCaret) {
+                        // Keep caret at end of the (previous) line so it doesn't drop to next line
+                        const targetLine = Math.max(0, Math.min(caretStart.line, editor.document.lineCount - 1));
+                        const endPos = editor.document.lineAt(targetLine).range.end;
+                        editor.selection = new vscode.Selection(endPos, endPos);
+                    }
+                    // Otherwise, allow VS Code to move caret naturally with text
+                }
             } catch (e) {
-                console.warn('[CodeWithMe] Could not restore selection after remote edit.', e);
+                console.warn('[CodeWithMe] Smart selection restore skipped due to error', e);
             }
         }
 
