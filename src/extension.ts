@@ -1,4 +1,4 @@
-// Track files currently being updated from remote to suppress local echo
+            // Track files currently being updated from remote to suppress local echo
 const updatingFromRemoteFiles: Set<string> = new Set();
 // Live Share style collaborative coding extension
 import * as vscode from 'vscode';
@@ -269,6 +269,8 @@ let currentRole: 'host' | 'guest' | null = null;
 let collaborativeSession: any = null;
 let participantCursors: Map<string, any> = new Map();
 let participantCursorDecorations: Map<string, vscode.TextEditorDecorationType> = new Map();
+// Separate label decoration rendered at end-of-line so names don't appear inline between characters
+let participantCursorLabelDecorations: Map<string, vscode.TextEditorDecorationType> = new Map();
 let lastSessionUrl: string = '';
 let hostSessionPermissions: SessionPermissions | null = null;
 let guestSessionPermissions: SessionPermissions | null = null;
@@ -309,6 +311,10 @@ const CURSOR_DECORATE_MS = 40;
 const cursorSendTimers: Map<string, NodeJS.Timeout> = new Map(); // key: filePath
 const lastSentCursorPos: Map<string, { line: number; character: number }> = new Map();
 const CURSOR_SEND_MS = 45;
+
+// File-open broadcast debounce to avoid spamming when toggling editors
+const lastFileOpenBroadcastAt: Map<string, number> = new Map(); // key: filePath -> timestamp
+const FILE_OPEN_BROADCAST_DEBOUNCE_MS = 800;
 
 // Per-file apply queue to serialize incoming edits and avoid interleaving
 const perFileApplyQueue: Map<string, Promise<void>> = new Map();
@@ -421,27 +427,37 @@ function getParticipantCursorDecoration(participantId: string, userName: string)
         return participantCursorDecorations.get(participantId)!;
     }
 
-    // Neutral, subtle styling (transparent-like) with smaller name label
-    // Use a very light border and a small, unobtrusive label without solid background color
-    const borderColor = 'rgba(128,128,128,0.35)';
-    const labelColor = '#888';
+    // Ultra-light, non-intrusive caret box only (no inline name)
+    const borderColor = 'rgba(128,128,128,0.25)';
     const decoration = vscode.window.createTextEditorDecorationType({
-        // Thin, subtle border to indicate cursor without strong color
+        // Very thin outline to indicate remote caret location without distraction
         border: `1px solid ${borderColor}`,
-        borderRadius: '2px',
-        after: {
-            contentText: ` ${userName}`,
-            margin: '0 0 0 4px',
-            backgroundColor: 'transparent',
-            color: labelColor,
-            border: `1px solid rgba(128,128,128,0.25)`,
-            // Make the label smaller and more transparent
-            textDecoration: 'none; font-size: 12px; opacity: 0.7; padding: 0 2px; border-radius: 2px;',
-            fontWeight: 'normal',
-        },
+        borderRadius: '1px',
+        rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen
     });
 
     participantCursorDecorations.set(participantId, decoration);
+    return decoration;
+}
+
+// Label decoration shown at end-of-line (not inline at caret)
+function getParticipantCursorLabelDecoration(participantId: string, userName: string): vscode.TextEditorDecorationType {
+    if (participantCursorLabelDecorations.has(participantId)) {
+        return participantCursorLabelDecorations.get(participantId)!;
+    }
+    const labelColor = 'rgba(136,136,136,0.65)';
+    const decoration = vscode.window.createTextEditorDecorationType({
+        isWholeLine: false,
+        rangeBehavior: vscode.DecorationRangeBehavior.OpenOpen,
+        after: {
+            contentText: `  ${userName}  `,
+            margin: '0 0 0 8px',
+            color: labelColor,
+            backgroundColor: 'rgba(136,136,136,0.08)',
+            textDecoration: 'none; font-size: 10px; padding: 0 6px; border-radius: 4px;'
+        }
+    });
+    participantCursorLabelDecorations.set(participantId, decoration);
     return decoration;
 }
 
@@ -1059,6 +1075,19 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
         }
 
         switch (msg.type) {
+            case 'file-opened': {
+                try {
+                    const openerId: string | undefined = msg.participantId;
+                    const openerName: string = msg.userName || 'Participant';
+                    const p: string | undefined = msg.filePath || msg.path;
+                    if (p && openerId !== currentUserId) {
+                        vscode.window.showInformationMessage(`${openerName} opened ${p}`);
+                    }
+                } catch (e) {
+                    console.warn('[CodeWithMe] Failed to process file-opened message', e);
+                }
+                break;
+            }
             case 'file-change':
                 await handleFileChange(msg, role);
                 break;
@@ -1158,11 +1187,14 @@ async function handleCollaborativeMessage(msg: any, role: 'Host' | 'Guest') {
                 if (role === 'Host') {
                     try {
                         const filePath = msg.filePath || msg.data;
+                        const guestId = msg.participantId || msg.guestId;
+                        const guestName = msg.userName || (guestId && currentSession?.participants?.get(guestId)?.name) || 'Guest';
                         console.log('[CodeWithMe] Host: open-file received for', filePath);
                         if (filePath) {
-                            // Do not open the file locally on Host; only stream content back to Guest
-                            // Immediately stream content back to Guest
+                            // Immediately stream content back to Guest (no local open)
                             await openFileForGuest(filePath);
+                            // Broadcast a file-opened event so all participants see a notification
+                            try { ws?.send(JSON.stringify({ type: 'file-opened', filePath, participantId: guestId || msg.participantId, userName: guestName, timestamp: Date.now() })); } catch {}
                         }
                     } catch (e) {
                         console.error('[CodeWithMe] Host: Failed to handle open-file:', e);
@@ -1473,6 +1505,39 @@ function setupEditorChangeListeners() {
         }
     });
     sessionDisposables.push(onWillSaveDisp);
+
+    // Broadcast a "file-opened" event whenever the active editor changes (host or guest)
+    const onActiveEditorDisp = vscode.window.onDidChangeActiveTextEditor((editor) => {
+        try {
+            if (!editor || !(ws && ws.readyState === 1)) { return; }
+            let fp = editor.document.uri.fsPath;
+            if (currentRole === 'guest') {
+                try {
+                    for (const [hostPath, doc] of guestUntitledMap.entries()) {
+                        if (doc === editor.document) { fp = hostPath; break; }
+                    }
+                } catch {}
+            }
+            if (!fp) { return; }
+            const now = Date.now();
+            const last = lastFileOpenBroadcastAt.get(fp) || 0;
+            if (now - last < FILE_OPEN_BROADCAST_DEBOUNCE_MS) { return; }
+            lastFileOpenBroadcastAt.set(fp, now);
+            const userName = getDisplayUserName(currentRole || undefined as any);
+            try {
+                ws!.send(JSON.stringify({
+                    type: 'file-opened',
+                    filePath: fp,
+                    participantId: currentUserId,
+                    userName,
+                    timestamp: now
+                }));
+            } catch (e) {
+                console.warn('[CodeWithMe] Failed to broadcast file-opened', e);
+            }
+        } catch {}
+    });
+    sessionDisposables.push(onActiveEditorDisp);
 
     // Track cursor position changes
     const onSelDisp = vscode.window.onDidChangeTextEditorSelection(async (event) => {
@@ -1845,7 +1910,9 @@ async function handleCursorPosition(msg: any, role: 'Host' | 'Guest') {
     const scheduleDecorate = () => {
         const editor = vscode.window.activeTextEditor;
         if (!editor) { return; }
-        const decorationType = getParticipantCursorDecoration(participantId, msg.user?.userName || 'Guest');
+        const userName = msg.user?.userName || 'Guest';
+        const caretDeco = getParticipantCursorDecoration(participantId, userName);
+        const labelDeco = getParticipantCursorLabelDecoration(participantId, userName);
         let currentEditorHostPath = editor.document.uri.fsPath;
         if (currentRole === 'guest') {
             try {
@@ -1855,10 +1922,16 @@ async function handleCursorPosition(msg: any, role: 'Host' | 'Guest') {
             } catch {}
         }
         if (msg.filePath === currentEditorHostPath) {
-            const range = new vscode.Range(msg.position, msg.position);
-            editor.setDecorations(decorationType, [range]);
+            const caretRange = new vscode.Range(msg.position, msg.position);
+            editor.setDecorations(caretDeco, [caretRange]);
+            // Label at end of the same line
+            const line = Math.min(msg.position.line, editor.document.lineCount - 1);
+            const lineEndPos = editor.document.lineAt(line).range.end;
+            const endRange = new vscode.Range(lineEndPos, lineEndPos);
+            editor.setDecorations(labelDeco, [endRange]);
         } else {
-            editor.setDecorations(decorationType, []);
+            editor.setDecorations(caretDeco, []);
+            editor.setDecorations(labelDeco, []);
         }
     };
 
@@ -2267,7 +2340,9 @@ async function openFileInGuestEditor(filePath: string) {
             pendingFileContentRequests.add(filePath);
             ws.send(JSON.stringify({
                 type: 'request-file-content',
-                filePath: filePath
+                filePath: filePath,
+                participantId: currentUserId,
+                userName: getDisplayUserName('guest')
             }));
             // Don't show the "requesting" message - just open the file
             console.log(`[CodeWithMe] Guest: Requesting file content for: ${filePath}`);
